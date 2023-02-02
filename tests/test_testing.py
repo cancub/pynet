@@ -18,8 +18,15 @@ class TestLogTestingMixin(TestCase):
         self.mixin_tester = MixinTester()
 
     def _run_logging_test(
-        self, regex: bool, log_str: str, msgs_args: list[str | list[str]]
+        self,
+        regex: bool,
+        msgs_args: list[str | list[str]],
+        in_logs: bool,
+        log_str: str = None,
     ):
+        not_str = '' if in_logs else 'Not'
+        assertion = getattr(self.mixin_tester, f'assert{not_str}InLogs')
+
         for level in [
             logging.DEBUG,
             logging.INFO,
@@ -35,24 +42,45 @@ class TestLogTestingMixin(TestCase):
                         )
                     )
                     stack.enter_context(
-                        self.mixin_tester.assertInLogs(
-                            __name__, level, msgs, regex=regex
-                        )
+                        assertion(__name__, level, msgs, regex=regex)
                     )
 
-                    log.log(level, log_str)
+                    if log_str:
+                        log.log(level, log_str)
 
     def test_assert_in_logs_not_regex(self):
         self._run_logging_test(
-            regex=False, log_str='test', msgs_args=['test', ['tes', 'est']]
+            regex=False,
+            msgs_args=['test', ['tes', 'est']],
+            in_logs=True,
+            log_str='test',
         )
 
     def test_assert_in_logs_with_regex(self):
         self._run_logging_test(
             regex=True,
-            log_str='test',
             msgs_args=['tes.', [r't\w{2}t', 'te.t']],
+            in_logs=True,
+            log_str='test',
         )
+
+    def test_assert_not_in_logs_not_regex(self):
+        for log_str in [None, 'test']:
+            self._run_logging_test(
+                regex=False,
+                msgs_args=['foo', ['bar', 'baz']],
+                in_logs=False,
+                log_str=log_str,
+            )
+
+    def test_assert_not_in_logs_with_regex(self):
+        for log_str in [None, 'test']:
+            self._run_logging_test(
+                regex=True,
+                msgs_args=['f.o', [r't\w{3}t', r't\dst']],
+                in_logs=False,
+                log_str=log_str,
+            )
 
 
 if __name__ == '__main__':
