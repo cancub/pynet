@@ -37,13 +37,9 @@ class TestLogTestingMixin(TestCase):
             for msgs in msgs_args:
                 with ExitStack() as stack:
                     stack.enter_context(
-                        self.subTest(
-                            level=level, is_list=isinstance(msgs, list)
-                        )
+                        self.subTest(level=level, is_list=isinstance(msgs, list))
                     )
-                    stack.enter_context(
-                        assertion(__name__, level, msgs, regex=regex)
-                    )
+                    stack.enter_context(assertion(__name__, level, msgs, regex=regex))
 
                     if log_str:
                         log.log(level, log_str)
@@ -81,6 +77,11 @@ class TestLogTestingMixin(TestCase):
                 in_logs=False,
                 log_str=log_str,
             )
+
+    def test_assert_in_logs_but_nothing_logged(self):
+        with self.assertRaises(AssertionError):
+            with self.mixin_tester.assertInLogs(__name__, logging.DEBUG, 'test'):
+                pass
 
 
 if __name__ == '__main__':
