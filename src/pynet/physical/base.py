@@ -1,3 +1,12 @@
+"""
+Base classes for physical media and transceivers, with these classes handling the
+low-level details of connecting and disconnecting transceivers from media. Subclasses
+of these base classes define the specifics of how transceivers connect to media and
+how data is transmitted over the media.
+
+:author: Alf O'Kenney
+"""
+
 from __future__ import annotations
 
 import logging
