@@ -23,10 +23,10 @@ class Medium(ABC):
 
     Just as in real life, a :class:`Medium` is passive in its interactions with a
     :class:`Transceiver`. That is, a :class:`Medium` instance does not initiate any
-    connections or disconnections, nor does it send or receive data. In PyNet, it exists
-    merely as a record-keeper of the :class:`Transceiver` instances that are connected to
-    it and as a means of transporting data between those :class:`Transceiver` instances in
-    a manner that simulates the physical medium.
+    connections or disconnections, nor does it request data. In PyNet, it exists merely as
+    a record-keeper of the :class:`Transceiver` instances that are connected to it and as
+    a means of transporting data between those :class:`Transceiver` instances in a manner
+    that simulates the physical medium.
 
     Subclasses of :class:`Medium` define their own connection and disconnection logic by
     overriding the :meth:`_subclass_connect` and :meth:`_subclass_disconnect` methods.
@@ -40,7 +40,7 @@ class Medium(ABC):
     connected to a :class:`Transceiver` instance, the :meth:`Transceiver.connect` method
     must with the :class:`Medium` instance as an argument."""
 
-    _transceivers: dict[Transceiver, Any] = {}
+    _transceivers: set[Transceiver] = set()
 
     def __repr__(self) -> str:
         # This is just a placeholder to prevent logs from being unwieldy. Subclasses
@@ -60,14 +60,14 @@ class Medium(ABC):
         raise NotImplementedError
 
     def _connect(self, transceiver: Transceiver, **kwargs):
-        """Connect a :class:`Transceiver` instance to the medium and optionally store
-        metadata provided by the subclass.
+        """Connect a :class:`Transceiver` instance to the medium.
 
         :param transceiver: The :class:`Transceiver` instance to connect to the medium.
 
         NOTE: This method is called by :meth:`Transceiver.connect` and must not be
         called in any other contexts."""
-        self._transceivers[transceiver] = self._subclass_connect(transceiver, **kwargs)
+        self._subclass_connect(transceiver, **kwargs)
+        self._transceivers.add(transceiver)
 
     def _disconnect(self, transceiver: Transceiver):
         """Disconnect a :class:`Transceiver` instance from the medium.
@@ -78,8 +78,7 @@ class Medium(ABC):
         NOTE: This method is called by :meth:`Transceiver.disconnect` and must not be
         called in any other contexts."""
         self._subclass_disconnect(transceiver)
-
-        del self._transceivers[transceiver]
+        self._transceivers.remove(transceiver)
 
 
 class Transceiver(ABC):
@@ -171,6 +170,9 @@ class Transceiver(ABC):
 
         # Make sure that both the subclass and the :class:`Medium` subclass run their
         # respective connection logic.
+        # NOTE:
+        # Order is important here. The medium will need to know the transceiver's
+        # information in some cases.
         self._connect(new_medium, **kwargs)
         new_medium._connect(self, **kwargs)
         self._medium = new_medium

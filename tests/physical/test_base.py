@@ -208,12 +208,10 @@ class TestMedium(TestCase, LogTestingMixin):
         medium = MockMedium()
         transceiver = MockTransceiver()
 
-        connect_mock.return_value = metadata = {'test': 'value'}
-
         transceiver.connect(medium)
 
         connect_mock.assert_called_once_with(transceiver)
-        self.assertEqual(metadata, medium._transceivers[transceiver])
+        self.assertIn(transceiver, medium._transceivers)
 
         transceiver.disconnect()
         disconnect_mock.assert_called_once_with(transceiver)
