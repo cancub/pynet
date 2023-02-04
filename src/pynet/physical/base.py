@@ -47,6 +47,8 @@ class Medium(ABC):
         # should override this method to provide more useful information.
         return f'<{self.__class__.__name__}>'
 
+    # region Abstract methods
+
     @abstractmethod
     def _subclass_connect(self, transceiver: Transceiver) -> Any:
         """Run class-specific connection logic and return any metadata to be stored in
@@ -58,6 +60,10 @@ class Medium(ABC):
         """Run class-specific disconnection logic associated with the removal of a
         :class:`Transceiver` from the medium"""
         raise NotImplementedError
+
+    # endregion
+
+    # region Private methods
 
     def _connect(self, transceiver: Transceiver, **kwargs):
         """Connect a :class:`Transceiver` instance to the medium.
@@ -79,6 +85,8 @@ class Medium(ABC):
         called in any other contexts."""
         self._subclass_disconnect(transceiver)
         self._transceivers.remove(transceiver)
+
+    # endregion
 
 
 class Transceiver(ABC):
@@ -105,6 +113,28 @@ class Transceiver(ABC):
             medium_str = 'disconnected'
         return f'<{self.__class__.__name__} ({medium_str})>'
 
+    # region Properties
+
+    @property
+    @abstractmethod
+    def location(self):
+        """The location of the transceiver. Details of this are subclass-specific. For
+        example, a 10Base5 transceiver's location may be a 1D position along a coaxial
+        cable, whereas a WiFi transceiver may be in 3D space."""
+        raise NotImplementedError
+
+    @property
+    def medium(self) -> Medium:
+        return self._medium
+
+    @medium.setter
+    def medium(self, medium: Medium) -> None:
+        self.connect(medium)
+
+    # endregion
+
+    # region Abstract methods
+
     @abstractmethod
     def _connect(self, medium: Medium, **kwargs):
         """Class-specific connection logic"""
@@ -126,13 +156,9 @@ class Transceiver(ABC):
         """Receive data from the medium"""
         raise NotImplementedError
 
-    @property
-    def medium(self) -> Medium:
-        return self._medium
+    # endregion
 
-    @medium.setter
-    def medium(self, medium: Medium) -> None:
-        self.connect(medium)
+    # region Public methods
 
     def connect(self, new_medium: Medium, replace=False, **kwargs) -> None:
         if not new_medium:
@@ -191,3 +217,5 @@ class Transceiver(ABC):
         self._disconnect()
         medium._disconnect(self)
         self._medium = None
+
+    # endregion

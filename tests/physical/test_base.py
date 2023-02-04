@@ -34,6 +34,10 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium]):
     """A helper class for testing the :class:`Transceiver` class. Defines the necessary
     abstract methods to instantiate the class."""
 
+    @property
+    def location(self):
+        pass
+
     def _connect(self, medium: MockMedium):
         pass
 
