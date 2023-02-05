@@ -16,7 +16,7 @@ from typing import Optional, Type
 from .base import Medium, Transceiver
 from .exceptions import InvalidLocationError, NoSuitableLocationsError
 
-__all__ = ['Coaxial', 'TenBaseFiveTransceiver', 'Thicknet']
+__all__ = ['Coaxial', 'RG_8U', 'TenBaseFiveTransceiver']
 
 log = logging.getLogger(__name__)
 
@@ -32,8 +32,8 @@ class Coaxial(Medium):
         self.length = length
 
 
-class Thicknet(Coaxial):
-    """Thicknet is a type of coaxial cable used in Ethernet networks. In order to prevent
+class RG_8U(Coaxial):
+    """RG-8/U is a type of coaxial cable used in Ethernet networks. In order to prevent
     signal reflections at the end of the cable, a terminator is used, with this most
     commonly being a 50 ohm resistor that is connected via a male N-type connector.
     TODO:
@@ -58,7 +58,7 @@ class Thicknet(Coaxial):
         except AttributeError:
             raise TypeError(
                 'Tranceivers must have a length class attribute to be connected to a '
-                'Thicknet cable.'
+                'RG_8U cable.'
             )
 
         self._xcvr_type: Type[Transceiver] = xcvr_type
@@ -226,8 +226,8 @@ class Thicknet(Coaxial):
 # region Transceivers
 
 
-class TenBaseFiveTransceiver(Transceiver, supported_media=[Thicknet]):
-    """The OG Ethernet transceiver. Connected in a bus topology on a thicknet cable.
+class TenBaseFiveTransceiver(Transceiver, supported_media=[RG_8U]):
+    """The OG Ethernet transceiver. Connected in a bus topology on an RG-8/U cable.
     Nodes are connected along the cable via
     `vampire taps<https://en.wikipedia.org/wiki/Vampire_tap>`_.
 
@@ -252,11 +252,11 @@ class TenBaseFiveTransceiver(Transceiver, supported_media=[Thicknet]):
 
     # region Redefined Methods
 
-    def _connect(self, coax: Thicknet, location: int = None):
-        """Connect to a thicknet cable via vampire connection, checking if there is
+    def _connect(self, coax: RG_8U, location: int = None):
+        """Connect to an RG-8/U cable via vampire connection, checking if there is
         enough space between this transceiver and the next transceiver on the cable.
 
-        :param coax: The :class:`Thicknet` cable to which this transceiver will connect
+        :param coax: The :class:`RG_8U` cable to which this transceiver will connect
         :param location: The location (in meters) from the start of the cable. If not
             provided, it is assumed that the is connecting the transceiver the optimal
             location from other transceivers / the ends of the cable.

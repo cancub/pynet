@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from unittest import TestCase, main
 
 from pynet.physical.base import Transceiver
-from pynet.physical.ethernet import Thicknet, TenBaseFiveTransceiver
+from pynet.physical.ethernet import RG_8U, TenBaseFiveTransceiver
 from pynet.physical.exceptions import InvalidLocationError, NoSuitableLocationsError
 from pynet.testing import LogTestingMixin
 
@@ -14,7 +14,7 @@ class EthernetTestCase(TestCase, LogTestingMixin):
     def setUp(self):
         super().setUp()
         self.xcvr = TenBaseFiveTransceiver()
-        self.coax = Thicknet(length=6, xcvr_type=TenBaseFiveTransceiver)
+        self.coax = RG_8U(length=6, xcvr_type=TenBaseFiveTransceiver)
 
     @contextmanager
     def assertInEthLogs(self, level, msgs, *args, **kwargs):
@@ -27,13 +27,13 @@ class EthernetTestCase(TestCase, LogTestingMixin):
             yield
 
 
-class TestThicknet(EthernetTestCase):
+class TestRG_8U(EthernetTestCase):
 
     # region Dunders
 
     def test_init(self):
         length = 8
-        coax = Thicknet(length=length, xcvr_type=TenBaseFiveTransceiver)
+        coax = RG_8U(length=length, xcvr_type=TenBaseFiveTransceiver)
 
         self.assertEqual(coax.length, length)
         self.assertEqual(coax._xcvrs, set())
@@ -44,17 +44,17 @@ class TestThicknet(EthernetTestCase):
         )
 
     def test_init_with_xcvr_with_no_length(self):
-        class BadTransceiver(Transceiver, supported_media=[Thicknet]):
+        class BadTransceiver(Transceiver, supported_media=[RG_8U]):
             pass
 
         with self.assertRaisesRegex(
             TypeError,
             (
                 'Tranceivers must have a length class attribute to be connected to a '
-                'Thicknet cable.'
+                'RG_8U cable.'
             ),
         ):
-            Thicknet(length=1, xcvr_type=BadTransceiver)
+            RG_8U(length=1, xcvr_type=BadTransceiver)
 
     # endregion
 
