@@ -23,10 +23,10 @@ class MockMedium(Medium):
     def __repr__(self):
         return f'<{self.__class__.__name__} (name={self.name!r})>'
 
-    def _subclass_connect(self, transceiver: MockTransceiver):
+    def _subclass_connect(self, xcvr: MockTransceiver):
         pass
 
-    def _subclass_disconnect(self, transceiver: MockTransceiver):
+    def _subclass_disconnect(self, xcvr: MockTransceiver):
         pass
 
 
@@ -78,58 +78,58 @@ class TestTransceiver(TestCase, LogTestingMixin):
 
     @patch.object(MockTransceiver, 'connect')
     def test_medium_setter_wraps_connect(self, connect_mock):
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
         medium = MockMedium()
-        transceiver.medium = medium
+        xcvr.medium = medium
 
         connect_mock.assert_called_once_with(medium)
 
     def test_medium_getter(self):
         medium = MockMedium()
-        transceiver = MockTransceiver()
-        self.assertIsNone(transceiver.medium)
+        xcvr = MockTransceiver()
+        self.assertIsNone(xcvr.medium)
 
-        transceiver._medium = medium
-        self.assertEqual(transceiver.medium, medium)
+        xcvr._medium = medium
+        self.assertEqual(xcvr.medium, medium)
 
     @patch.object(MockTransceiver, 'disconnect')
     def test_connecting_nothing_same_as_disconnecting(self, disconnect_mock):
-        transceiver = MockTransceiver()
-        transceiver.medium = MockMedium()
+        xcvr = MockTransceiver()
+        xcvr.medium = MockMedium()
 
         with self.assertInBaseLogs(
             'DEBUG', 'Connecting to non-existant medium. Assuming disconnect'
         ):
-            transceiver.connect(None)
+            xcvr.connect(None)
 
         disconnect_mock.assert_called_once()
 
     def test_connecting_same_medium_does_nothing(self):
         medium_name = 'test'
         medium = MockMedium(name=medium_name)
-        transceiver = MockTransceiver()
-        transceiver.medium = medium
+        xcvr = MockTransceiver()
+        xcvr.medium = medium
 
         with self.assertNotInBaseLogs(
             'DEBUG',
             'Connecting.*MockTransceiver',
             regex=True,
         ):
-            transceiver.connect(medium)
+            xcvr.connect(medium)
 
     def test_connect_unsupported_medium_raises(self):
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
 
         with self.assertRaisesRegex(ValueError, 'Medium.*not supported by.*Transceiver'):
-            transceiver.connect(object())
+            xcvr.connect(object())
 
     def test_connecting_without_replace_when_already_connected_raises(self):
         medium = MockMedium()
-        transceiver = MockTransceiver()
-        transceiver.medium = medium
+        xcvr = MockTransceiver()
+        xcvr.medium = medium
 
         with self.assertRaisesRegex(RuntimeError, 'Transceiver.*already connected to'):
-            transceiver.connect(MockMedium())
+            xcvr.connect(MockMedium())
 
     @patch.object(MockTransceiver, '_disconnect')
     @patch.object(MockTransceiver, '_connect')
@@ -141,7 +141,7 @@ class TestTransceiver(TestCase, LogTestingMixin):
         second_name = 'second'
         first_medium = MockMedium(name=first_name)
         second_medium = MockMedium(name=second_name)
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
 
         disconnected_str = '<MockTransceiver (disconnected)>'
 
@@ -149,7 +149,7 @@ class TestTransceiver(TestCase, LogTestingMixin):
             'DEBUG',
             f'Connecting {disconnected_str} to <MockMedium (name={first_name!r})>',
         ):
-            transceiver.connect(first_medium)
+            xcvr.connect(first_medium)
 
         with self.assertInBaseLogs(
             'DEBUG',
@@ -158,15 +158,15 @@ class TestTransceiver(TestCase, LogTestingMixin):
                 f'Connecting {disconnected_str} to <MockMedium (name={second_name!r})>',
             ],
         ):
-            transceiver.connect(second_medium, replace=True)
+            xcvr.connect(second_medium, replace=True)
 
         connect_mock.assert_has_calls([call(first_medium), call(second_medium)])
         disconnect_mock.assert_called_once()
-        self.assertEqual(transceiver._medium, second_medium)
+        self.assertEqual(xcvr._medium, second_medium)
 
     @patch.object(MockTransceiver, 'disconnect')
     def test_connecting_when_disconnected_does_not_disconnect(self, disconnect_mock):
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
         medium = MockMedium()
 
         with self.assertNotInBaseLogs(
@@ -177,30 +177,30 @@ class TestTransceiver(TestCase, LogTestingMixin):
                 'Connecting.*MockTransceiver.*to.*MockMedium',
                 regex=True,
             ):
-                transceiver.connect(medium)
+                xcvr.connect(medium)
 
         disconnect_mock.assert_not_called()
 
     @patch.object(MockTransceiver, '_disconnect')
     def test_disconnect_called_when_already_disconnected(self, disconnect_mock):
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
 
         with self.assertNotInBaseLogs(
             'DEBUG', 'Disconnecting.*MockTransceiver', regex=True
         ):
-            transceiver.disconnect()
+            xcvr.disconnect()
 
         disconnect_mock.assert_not_called()
 
     def test_successful_disconnect(self):
         medium = MockMedium()
-        transceiver = MockTransceiver()
-        transceiver.medium = medium
+        xcvr = MockTransceiver()
+        xcvr.medium = medium
 
         with self.assertInBaseLogs('DEBUG', 'Disconnecting.*MockTransceiver', regex=True):
-            transceiver.disconnect()
+            xcvr.disconnect()
 
-        self.assertIsNone(transceiver._medium)
+        self.assertIsNone(xcvr._medium)
 
 
 class TestMedium(TestCase, LogTestingMixin):
@@ -210,16 +210,16 @@ class TestMedium(TestCase, LogTestingMixin):
         self, connect_mock, disconnect_mock
     ):
         medium = MockMedium()
-        transceiver = MockTransceiver()
+        xcvr = MockTransceiver()
 
-        transceiver.connect(medium)
+        xcvr.connect(medium)
 
-        connect_mock.assert_called_once_with(transceiver)
-        self.assertIn(transceiver, medium._transceivers)
+        connect_mock.assert_called_once_with(xcvr)
+        self.assertIn(xcvr, medium._xcvrs)
 
-        transceiver.disconnect()
-        disconnect_mock.assert_called_once_with(transceiver)
-        self.assertNotIn(transceiver, medium._transceivers)
+        xcvr.disconnect()
+        disconnect_mock.assert_called_once_with(xcvr)
+        self.assertNotIn(xcvr, medium._xcvrs)
 
 
 if __name__ == '__main__':

@@ -40,7 +40,7 @@ class Medium(ABC):
     connected to a :class:`Transceiver` instance, the :meth:`Transceiver.connect` method
     must with the :class:`Medium` instance as an argument."""
 
-    _transceivers: set[Transceiver] = set()
+    _xcvrs: set[Transceiver] = set()
 
     def __repr__(self) -> str:
         # This is just a placeholder to prevent logs from being unwieldy. Subclasses
@@ -50,13 +50,13 @@ class Medium(ABC):
     # region Abstract methods
 
     @abstractmethod
-    def _subclass_connect(self, transceiver: Transceiver) -> Any:
+    def _subclass_connect(self, xcvr: Transceiver) -> Any:
         """Run class-specific connection logic and return any metadata to be stored in
-        the :attr:`_transceivers` dictionary alongside the :class:`Transceiver`"""
+        the :attr:`_xcvrs` dictionary alongside the :class:`Transceiver`"""
         raise NotImplementedError
 
     @abstractmethod
-    def _subclass_disconnect(self, transceiver: Transceiver):
+    def _subclass_disconnect(self, xcvr: Transceiver):
         """Run class-specific disconnection logic associated with the removal of a
         :class:`Transceiver` from the medium"""
         raise NotImplementedError
@@ -65,26 +65,25 @@ class Medium(ABC):
 
     # region Private methods
 
-    def _connect(self, transceiver: Transceiver, **kwargs):
+    def _connect(self, xcvr: Transceiver, **kwargs):
         """Connect a :class:`Transceiver` instance to the medium.
 
-        :param transceiver: The :class:`Transceiver` instance to connect to the medium.
+        :param xcvr: The :class:`Transceiver` instance to connect to the medium.
 
         NOTE: This method is called by :meth:`Transceiver.connect` and must not be
         called in any other contexts."""
-        self._subclass_connect(transceiver, **kwargs)
-        self._transceivers.add(transceiver)
+        self._subclass_connect(xcvr, **kwargs)
+        self._xcvrs.add(xcvr)
 
-    def _disconnect(self, transceiver: Transceiver):
+    def _disconnect(self, xcvr: Transceiver):
         """Disconnect a :class:`Transceiver` instance from the medium.
 
-        :param transceiver: The :class:`Transceiver` instance to disconnect from the
-            medium.
+        :param xcvr: The :class:`Transceiver` instance to disconnect from the medium.
 
         NOTE: This method is called by :meth:`Transceiver.disconnect` and must not be
         called in any other contexts."""
-        self._subclass_disconnect(transceiver)
-        self._transceivers.remove(transceiver)
+        self._subclass_disconnect(xcvr)
+        self._xcvrs.remove(xcvr)
 
     # endregion
 
