@@ -47,6 +47,16 @@ class Medium(ABC):
         # should override this method to provide more useful information.
         return f'<{self.__class__.__name__}>'
 
+    def __getattr__(self, name: str) -> Any:
+        """Really hammer the point home that the user should be calling connect() and
+        disconnect() on a Transceiver instance, not a Medium instance."""
+        if name in ('connect', 'disconnect'):
+            raise AttributeError(
+                f'{self.__class__.__name__} instances do not have a {name}() method. '
+                f'Use {name}() of an applicable Transceiver instance instead.'
+            )
+        raise AttributeError(f'{self.__class__.__name__} has no attribute {name}')
+
     # region Abstract methods
 
     @abstractmethod

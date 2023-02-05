@@ -10,6 +10,8 @@ from pynet.testing import LogTestingMixin
 
 BASE_TARGET = 'pynet.physical.base'
 
+# region Helper Classes
+
 
 class MockMedium(Medium):
     """A helper class for testing the :class:`Medium` class. Defines the necessary
@@ -49,6 +51,42 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium]):
 
     def listen(self, timeout: int | float = None):
         pass
+
+
+# endregion
+
+# region Tests
+
+
+class TestMedium(TestCase, LogTestingMixin):
+    def test_call_connect_disconnect(self):
+        medium = MockMedium()
+        msg_tmpl = (
+            r'MockMedium instances do not have a {0}\(\) method. Use {0}\(\) of an '
+            'applicable Transceiver instance instead.'
+        )
+
+        for name in ('connect', 'disconnect'):
+            with self.subTest(method=name):
+                with self.assertRaisesRegex(AttributeError, msg_tmpl.format(name)):
+                    getattr(medium, name)()
+
+    @patch.object(MockMedium, '_subclass_disconnect')
+    @patch.object(MockMedium, '_subclass_connect')
+    def test_metadata_processing_in_connect_and_disconnect(
+        self, connect_mock, disconnect_mock
+    ):
+        medium = MockMedium()
+        xcvr = MockTransceiver()
+
+        xcvr.connect(medium)
+
+        connect_mock.assert_called_once_with(xcvr)
+        self.assertIn(xcvr, medium._xcvrs)
+
+        xcvr.disconnect()
+        disconnect_mock.assert_called_once_with(xcvr)
+        self.assertNotIn(xcvr, medium._xcvrs)
 
 
 class TestTransceiver(TestCase, LogTestingMixin):
@@ -203,24 +241,7 @@ class TestTransceiver(TestCase, LogTestingMixin):
         self.assertIsNone(xcvr._medium)
 
 
-class TestMedium(TestCase, LogTestingMixin):
-    @patch.object(MockMedium, '_subclass_disconnect')
-    @patch.object(MockMedium, '_subclass_connect')
-    def test_metadata_processing_in_connect_and_disconnect(
-        self, connect_mock, disconnect_mock
-    ):
-        medium = MockMedium()
-        xcvr = MockTransceiver()
-
-        xcvr.connect(medium)
-
-        connect_mock.assert_called_once_with(xcvr)
-        self.assertIn(xcvr, medium._xcvrs)
-
-        xcvr.disconnect()
-        disconnect_mock.assert_called_once_with(xcvr)
-        self.assertNotIn(xcvr, medium._xcvrs)
-
+# endregion
 
 if __name__ == '__main__':
     main()
