@@ -40,7 +40,8 @@ class Medium(ABC):
     connected to a :class:`Transceiver` instance, the :meth:`Transceiver.connect` method
     must with the :class:`Medium` instance as an argument."""
 
-    _xcvrs: set[Transceiver] = set()
+    def __init__(self):
+        self._xcvrs: set[Transceiver] = set()
 
     def __repr__(self) -> str:
         # This is just a placeholder to prevent logs from being unwieldy. Subclasses
