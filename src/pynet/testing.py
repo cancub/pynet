@@ -3,6 +3,17 @@ from typing import Sequence
 from functools import partialmethod
 
 
+"""
+TODO:
+- fuse both log checks into one method
+    - have one param to a list of logs that _must_ be seen
+    - have another param to a list of logs that _must not_ be seen
+    - currently the issue is that if we want nested log checks, we need to use
+        assertNotInLogs on the outside and assertInLogs on the inside, which is
+        unintuitive
+"""
+
+
 class LogTestingMixin:
     @contextmanager
     def _logChecker(
