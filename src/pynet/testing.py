@@ -1,20 +1,24 @@
 from contextlib import contextmanager
 from typing import Sequence
 from functools import partialmethod
+from unittest.mock import Mock
 
+from .physical.base import Medium, Transceiver
 
-"""
-TODO:
-- fuse both log checks into one method
-    - have one param to a list of logs that _must_ be seen
-    - have another param to a list of logs that _must not_ be seen
-    - currently the issue is that if we want nested log checks, we need to use
-        assertNotInLogs on the outside and assertInLogs on the inside, which is
-        unintuitive
-"""
+__all__ = ['LogTestingMixin', 'ProcessBuilderMixin']
 
 
 class LogTestingMixin:
+    """A mixin for unittest.TestCase that provides methods for asserting logs.
+    TODO:
+    - fuse both log checks into one method
+        - have one param to a list of logs that _must_ be seen
+        - have another param to a list of logs that _must not_ be seen
+        - currently the issue is that if we want nested log checks, we need to use
+            assertNotInLogs on the outside and assertInLogs on the inside, which is
+            unintuitive
+    """
+
     @contextmanager
     def _logChecker(
         self,
@@ -60,3 +64,52 @@ class LogTestingMixin:
     assertInLogs = partialmethod(_logChecker, True)
 
     assertNotInLogs = partialmethod(_logChecker, False)
+
+
+class ProcessBuilderMixin:
+    medium_cls: type[Medium] = None
+    xcvr_cls: type[Transceiver] = None
+
+    def build_medium(self, name=None, mocked=False, auto_start=False, is_alive=None):
+        # Make sure that we have a unique name for each medium
+        name = name or f'test_{len(Medium._instances)}'
+
+        if mocked:
+            medium = Mock(spec=self.medium_cls)
+            medium.name = name
+            medium._connection_queue = Mock()
+        else:
+            medium = self.medium_cls(name=name, auto_start=auto_start)
+
+        if is_alive is not None:
+            medium.is_alive = Mock(return_value=is_alive)
+
+        return medium
+
+    def build_xcvr(
+        self,
+        name=None,
+        mocked=False,
+        location=None,
+        auto_start=False,
+        is_alive=None,
+        mock_medium=False,
+    ):
+        # Make sure that we have a unique name for each transceiver
+        name = name or f'test_{len(Transceiver._instances)}'
+
+        if mocked:
+            xcvr = Mock(spec=self.xcvr_cls)
+            xcvr.name = name
+        else:
+            xcvr = self.xcvr_cls(name=name, auto_start=auto_start)
+
+        if location is not None:
+            xcvr.location = location
+
+        if is_alive is not None:
+            xcvr.is_alive = Mock(return_value=is_alive)
+        if mock_medium:
+            xcvr._medium = self.build_medium(mocked=True)
+
+        return xcvr
