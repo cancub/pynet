@@ -8,3 +8,15 @@ class NoSuitableLocationsError(LocationError):
 
 class InvalidLocationError(LocationError):
     pass
+
+
+class ProcessNotRunningError(Exception):
+    pass
+
+
+class ConnectionError(Exception):
+    pass
+
+
+class NoMediumError(ConnectionError):
+    pass

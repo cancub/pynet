@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 class Coaxial(Medium):
     length: int
 
-    def __init__(self, length: int) -> None:
-        super().__init__()
+    def __init__(self, name: str, length: int, *args, **kwargs) -> None:
+        super().__init__(name, *args, **kwargs)
         self.length = length
 
 
@@ -47,8 +47,10 @@ class RG_8U(Coaxial):
 
     _standard_interval: int = 2.5  # meters (IEEE 802.3-1985)
 
-    def __init__(self, length: int, xcvr_type: Type[Transceiver]) -> None:
-        super().__init__(length)
+    def __init__(
+        self, name: str, length: int, xcvr_type: Type[Transceiver], *args, **kwargs
+    ) -> None:
+        super().__init__(length, *args, **kwargs)
 
         # Any transceiver that is connected to the cable must be connected via a tap. It
         # therefor must have a ``length`` attribute.
