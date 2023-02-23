@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Sequence
 from functools import partialmethod
@@ -8,7 +9,7 @@ from .physical.base import Medium, Transceiver
 __all__ = ['LogTestingMixin', 'ProcessBuilderMixin']
 
 
-class LogTestingMixin:
+class LogTestingMixin(ABC):
     """A mixin for unittest.TestCase that provides methods for asserting logs.
     TODO:
     - fuse both log checks into one method
@@ -18,6 +19,13 @@ class LogTestingMixin:
             assertNotInLogs on the outside and assertInLogs on the inside, which is
             unintuitive
     """
+
+    @property
+    @abstractmethod
+    def log_target(self) -> str:
+        """The target of the logs we're checking. This is the name of the logger that we
+        pass to assert[Not]InTargetLogs. Override as a class attribute."""
+        raise NotImplementedError
 
     @contextmanager
     def _logChecker(
@@ -64,6 +72,16 @@ class LogTestingMixin:
     assertInLogs = partialmethod(_logChecker, True)
 
     assertNotInLogs = partialmethod(_logChecker, False)
+
+    @contextmanager
+    def assertInTargetLogs(self, level, msgs, *args, **kwargs):
+        with self.assertInLogs(self.log_target, level, msgs, *args, **kwargs):
+            yield
+
+    @contextmanager
+    def assertNotInTargetLogs(self, level, msgs, *args, **kwargs):
+        with self.assertNotInLogs(self.log_target, level, msgs, *args, **kwargs):
+            yield
 
 
 class ProcessBuilderMixin:

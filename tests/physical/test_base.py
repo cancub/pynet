@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-from contextlib import contextmanager
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event, Lock
 from unittest import TestCase, main
@@ -52,16 +51,7 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium]):
 class TestPHYBase(TestCase, ProcessBuilderMixin, LogTestingMixin):
     medium_cls: type[Medium] = MockMedium
     xcvr_cls: type[Transceiver] = MockTransceiver
-
-    @contextmanager
-    def assertInBaseLogs(self, level, msgs, *args, **kwargs):
-        with self.assertInLogs(BASE_TARGET, level, msgs, *args, **kwargs):
-            yield
-
-    @contextmanager
-    def assertNotInBaseLogs(self, level, msgs, *args, **kwargs):
-        with self.assertNotInLogs(BASE_TARGET, level, msgs, *args, **kwargs):
-            yield
+    log_target: str = BASE_TARGET
 
     def build_unique_mock(self, *names):
         # Prevent cross-talk between unit tests by explicitly setting the attributes
@@ -180,7 +170,7 @@ class TestMedium(TestPHYBase):
         medium._stop_event.is_set.side_effect = [False, True]
         mock_thread = ThreadMock.return_value
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'DEBUG',
             [f'Starting medium process ({medium.pid})', f'{medium}: shutting down'],
         ):
@@ -222,7 +212,7 @@ class TestMedium(TestPHYBase):
         connect_mock.side_effect = err = Exception(err_str)
 
         # Use this test to check the debug logs as well.
-        with self.assertInBaseLogs('ERROR', f'{medium}: connection failed: {err_str}'):
+        with self.assertInTargetLogs('ERROR', f'{medium}: connection failed: {err_str}'):
             self._run_monitor_connections(medium)
 
         # Confirm that there was one connection and no disconnection.
@@ -250,7 +240,7 @@ class TestMedium(TestPHYBase):
         connect_mock.return_value = location
 
         # Use this test to check the debug logs as well.
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'DEBUG',
             ['Starting connection worker thread', 'Connection worker thread exiting'],
         ):
@@ -285,7 +275,7 @@ class TestMedium(TestPHYBase):
         err_str = 'Boom!'
         disconnect_mock.side_effect = Exception(err_str)
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             (
                 f'{medium}: subclass disconnection failed: {err_str}. Continuing with '
@@ -338,7 +328,7 @@ class TestMedium(TestPHYBase):
 
         medium._connection_queue.get.return_value = bad_conn_details = 666
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR', f'{medium}: unexpected connection format: {bad_conn_details}'
         ):
             self._run_monitor_connections(medium)
@@ -355,7 +345,7 @@ class TestMedium(TestPHYBase):
         medium = self.build_medium()
         medium._tx_ingress_queue.get.return_value = bad_tx = 666
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             (
                 f'{medium}: invalid transmission received ({bad_tx}). Format must be '
@@ -390,7 +380,7 @@ class TestMedium(TestPHYBase):
         # Now add a viable destination such that the processing of the data is attempted.
         receivers[dest_loc] = dest_conn
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             (
                 f'{medium}: error processing transmission ({data=}, {src_loc=}, '
@@ -420,7 +410,7 @@ class TestMedium(TestPHYBase):
         exc_str = 'A bad thing happened'
         dest_conn.send.side_effect = Exception(exc_str)
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             f'{medium}: error sending data={out_data!r} to receiver at {dest_loc=}: {exc_str}',
         ):
@@ -747,7 +737,7 @@ class TestTransceiver(TestPHYBase):
     def test_connecting_nothing_same_as_disconnecting(self, disconnect_mock):
         xcvr = self.build_xcvr(is_alive=True, mock_medium=True)
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'DEBUG', 'Connecting to medium=None. Assuming disconnect'
         ):
             xcvr.connect(None)
@@ -757,12 +747,12 @@ class TestTransceiver(TestPHYBase):
     def test_connecting_same_medium_does_nothing(self):
         xcvr = self.build_xcvr(is_alive=True, mock_medium=True)
 
-        with self.assertNotInBaseLogs(
+        with self.assertNotInTargetLogs(
             'DEBUG',
             'Connecting.*MockTransceiver',
             regex=True,
         ):
-            with self.assertInBaseLogs(
+            with self.assertInTargetLogs(
                 'DEBUG',
                 f'{xcvr!r} already connected to {self.medium_mock!r}',
             ):
@@ -875,7 +865,7 @@ class TestTransceiver(TestPHYBase):
         phy_listener_mock.recv.return_value = (Responses.OK, (location := 123))
 
         with patch.object(xcvr, 'is_alive', return_value=True):
-            with self.assertInBaseLogs(
+            with self.assertInTargetLogs(
                 'DEBUG', f'Connecting {xcvr!r} to {self.medium_mock!r}'
             ):
                 xcvr.connect(self.medium_mock, **kwargs)
@@ -895,7 +885,7 @@ class TestTransceiver(TestPHYBase):
     def test_disconnect_called_when_already_disconnected(self, disconnect_mock):
         xcvr = self.build_xcvr()
 
-        with self.assertNotInBaseLogs(
+        with self.assertNotInTargetLogs(
             'DEBUG', 'Disconnecting.*MockTransceiver', regex=True
         ):
             xcvr.disconnect()
@@ -917,7 +907,7 @@ class TestTransceiver(TestPHYBase):
         xcvr.location = location = 123
         xcvr._medium = self.medium_mock
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'DEBUG', f'Disconnecting {xcvr!r} from {self.medium_mock!r}'
         ):
             xcvr.disconnect()
@@ -957,7 +947,7 @@ class TestTransceiver(TestPHYBase):
 
         xcvr = self.build_xcvr()
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'DEBUG',
             ('Starting transceiver process', f'{xcvr}: shutting down'),
         ):
@@ -996,7 +986,7 @@ class TestTransceiver(TestPHYBase):
 
         phy_listener_mock.recv.side_effect = ValueError(err_str := 'bad recv')
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             f'{xcvr}: Error receiving data from medium: {err_str}',
         ):
@@ -1022,7 +1012,7 @@ class TestTransceiver(TestPHYBase):
 
         phy_listener_mock.recv.return_value = data = 0
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             f'{xcvr}: Error processing {data=}: {err_str}',
         ):
@@ -1052,7 +1042,7 @@ class TestTransceiver(TestPHYBase):
 
         osi_client_mock.send.side_effect = OSError(err_str := 'bad send')
 
-        with self.assertInBaseLogs(
+        with self.assertInTargetLogs(
             'ERROR',
             f'{xcvr}: Error sending data={out_data!r} to next layer up: {err_str}',
         ):

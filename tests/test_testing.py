@@ -20,6 +20,7 @@ class TestLogTestingMixin(TestCase):
         super().setUp()
 
         class MixinTester(TestCase, LogTestingMixin):
+            log_target = __name__
             pass
 
         self.mixin_tester = MixinTester()
@@ -89,6 +90,14 @@ class TestLogTestingMixin(TestCase):
         with self.assertRaises(AssertionError):
             with self.mixin_tester.assertInLogs(__name__, logging.DEBUG, 'test'):
                 pass
+
+    def test_assertInTargetLogs(self):
+        with self.mixin_tester.assertInTargetLogs(logging.DEBUG, 'test'):
+            log.debug('test')
+
+    def test_assertNotInTargetLogs(self):
+        with self.mixin_tester.assertNotInTargetLogs(logging.DEBUG, 'test'):
+            log.debug('foo')
 
 
 class MockMedium(Medium, dimensionality=1):
