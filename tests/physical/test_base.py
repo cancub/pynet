@@ -1,16 +1,23 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+from math import ceil
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event, Lock
 from unittest import TestCase, main
 from unittest.mock import Mock, call, patch
 
-from pynet.physical.base import Medium, Transceiver
-from pynet.physical.constants import CLOSE_MSG, Responses
+from pynet.physical.base import CommsManager, ConnRequest, Medium, Transceiver
+from pynet.physical.constants import (
+    NANOSECONDS_PER_SECOND,
+    SPEED_OF_LIGHT,
+    TIME_DILATION_FACTOR,
+    ManagementMessages,
+    CommsType,
+    Responses,
+)
 from pynet.physical.exceptions import (
     ConnectionError,
-    NoMediumError,
     ProcessNotRunningError,
 )
 from pynet.testing import LogTestingMixin, ProcessBuilderMixin
@@ -20,7 +27,7 @@ BASE_TARGET = 'pynet.physical.base'
 # region Helper Classes
 
 
-class MockMedium(Medium, dimensionality=1):
+class MockMedium(Medium, dimensionality=1, velocity_factor=0.77):
     """A helper class for testing the :class:`Medium` class. Defines the necessary
     abstract methods to instantiate the class."""
 
@@ -28,24 +35,168 @@ class MockMedium(Medium, dimensionality=1):
         with self._receivers_lock:
             return len(self._receivers)
 
-    def _process_transmission(self, data, *args, **kwargs):
-        return data
 
-
-class MockTransceiver(Transceiver, supported_media=[MockMedium]):
+class MockTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=1500):
     """A helper class for testing the :class:`Transceiver` class. Defines the necessary
     abstract methods to instantiate the class."""
 
-    def _process_incoming_data(self, data, *args, **kwargs):
+    def _process_rx_value(self, data, *args, **kwargs):
         return data
 
-    def _process_outgoing_data(self, data, *args, **kwargs):
+    def _next_tx_symbol(self, data, *args, **kwargs):
         return data
 
 
 # endregion
 
 # region Tests
+
+
+class TestCommsManager(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.cmgr = self._build_cmgr()
+
+    def _build_cmgr(
+        self, conn=None, buff_size=128, slot_ns=100, init_ns=0
+    ) -> CommsManager:
+        return CommsManager(
+            conn=conn or Mock(), buff_size=buff_size, slot_ns=slot_ns, init_ns=init_ns
+        )
+
+    def test__init__(self):
+        mock_conn = Mock()
+        buff_size = 1024
+        slot_ns = 100
+        init_ns = 1000
+
+        cmgr = CommsManager(
+            conn=mock_conn, buff_size=buff_size, slot_ns=slot_ns, init_ns=init_ns
+        )
+
+        self.assertEqual(cmgr._conn, mock_conn)
+        self.assertEqual(cmgr._buffer._data, [0] * buff_size)
+        self.assertEqual(cmgr._slot_ns, slot_ns)
+        self.assertEqual(cmgr.next_tx_ns, init_ns)
+        self.assertEqual(cmgr.next_rx_ns, init_ns)
+
+    def test_send(self):
+        cmgr = self.cmgr
+        conn = cmgr._conn
+        data = 1
+
+        conn.send.side_effect = ConnectionError(err_str := 'test')
+
+        with self.subTest('ConnectionError'):
+            with self.assertRaises(ConnectionError) as ctx:
+                cmgr._send(data)
+
+            self.assertEqual(
+                str(ctx.exception),
+                f'Could not send data to the Transceiver via {cmgr}: {err_str}',
+            )
+            conn.send.assert_called_once_with(data)
+
+        conn.reset_mock()
+        conn.send.side_effect = None
+
+        with self.subTest('Success'):
+            self.assertIsNone(cmgr._send(data))
+            conn.send.assert_called_once_with(data)
+
+    def test_recv(self):
+        cmgr = self.cmgr
+        conn = cmgr._conn
+
+        conn.recv.side_effect = ConnectionError(err_str := 'test')
+
+        with self.subTest('ConnectionError'):
+            with self.assertRaises(ConnectionError) as ctx:
+                cmgr._recv()
+
+            self.assertEqual(
+                str(ctx.exception),
+                f'Could not receive data from the Transceiver via {cmgr}: {err_str}',
+            )
+            conn.recv.assert_called_once_with()
+
+        conn.reset_mock()
+        conn.recv.side_effect = None
+        conn.recv.return_value = data = 1
+
+        with self.subTest('Success'):
+            self.assertEqual(cmgr._recv(), data)
+            conn.recv.assert_called_once_with()
+
+    def test_trigger_tx(self):
+        cmgr = self.cmgr
+        orig_next_tx_ns = cmgr.next_tx_ns
+        cmgr._conn.recv.return_value = (
+            symbol := 1.5,
+            duration_ns := 5,
+            tx_delta_ns := 10,
+        )
+
+        self.assertEqual(cmgr.trigger_tx(), (symbol, duration_ns * TIME_DILATION_FACTOR))
+        self.assertEqual(
+            cmgr.next_tx_ns, orig_next_tx_ns + tx_delta_ns * TIME_DILATION_FACTOR
+        )
+        cmgr._conn.send.assert_called_once_with((CommsType.TRANSMIT, None))
+
+    def test_trigger_rx(self):
+        cmgr = self.cmgr
+        conn = cmgr._conn
+        orig_next_rx_ns = cmgr.next_rx_ns
+        cmgr._buffer._data[0] = data = 1
+        conn.recv.return_value = rx_delta_ns = 10
+
+        cmgr.trigger_rx()
+        self.assertEqual(
+            cmgr.next_rx_ns, orig_next_rx_ns + rx_delta_ns * TIME_DILATION_FACTOR
+        )
+        conn.send.assert_called_once_with((CommsType.RECEIVE, data))
+
+    def test_advance_rx_buffer(self):
+        cmgr = self.cmgr
+
+        cmgr._buffer._data = [1, 2, 3, 4, 5]
+
+        cmgr.advance_rx_buffer()
+        self.assertEqual(cmgr._buffer._data, [0, 2, 3, 4, 5])
+
+        cmgr.advance_rx_buffer()
+        self.assertEqual(cmgr._buffer._data, [0, 0, 3, 4, 5])
+
+    def test_duration_in_slots(self):
+        cmgr = self.cmgr
+        slot_ns = cmgr._slot_ns
+
+        self.assertEqual(cmgr._duration_in_slots(slot_ns), 1)
+        self.assertEqual(cmgr._duration_in_slots(slot_ns - 1), 1)
+        self.assertEqual(cmgr._duration_in_slots(slot_ns + 1), 2)
+
+    def test_modify_buffer(self):
+        slot_ns = 100
+        cmgr = self._build_cmgr(buff_size=5, slot_ns=slot_ns)
+        cmgr._buffer._data = [1, 2, 3, 4, 5]
+
+        cmgr.modify_buffer(
+            symbol=1.5, start_delay_ns=slot_ns * 1.1, duration_ns=slot_ns * 2.5
+        )
+
+        # Starting two slots after the current slot, and ending 3 slots thereafter
+        self.assertEqual(cmgr._buffer._data, [1, 2, 4.5, 5.5, 6.5])
+
+        # Move one slot into the future
+        cmgr.advance_rx_buffer()
+        self.assertEqual(cmgr._buffer._data, [0, 2, 4.5, 5.5, 6.5])
+
+        # Test the wrapping around of data and also what happens when the start delay and
+        # the duration of the transmission are exact multiples of the slot size.
+        cmgr.modify_buffer(symbol=-0.5, start_delay_ns=slot_ns, duration_ns=slot_ns * 4)
+
+        # The transmission occurs
+        self.assertEqual(cmgr._buffer._data, [-0.5, 2, 4, 5, 6])
 
 
 class TestPHYBase(TestCase, ProcessBuilderMixin, LogTestingMixin):
@@ -60,25 +211,23 @@ class TestPHYBase(TestCase, ProcessBuilderMixin, LogTestingMixin):
 
 
 class TestMedium(TestPHYBase):
-    def _run_monitor_connections(self, medium):
-        medium._monitor_connections(
-            medium._connection_queue,
-            medium._receivers,
-            medium._receivers_lock,
-            medium._stop_event,
-        )
-
     # region Dunders
 
     def test__init_subclass__(self):
-        for dimensionality in (1, 3):
-            with self.subTest(dimensionality=dimensionality):
+        for dim in (1, 3):
+            for vf in (0.1, 1):
+                with self.subTest(dimensionality=dim, vf=vf):
 
-                class DummyMedium(Medium, dimensionality=dimensionality):
-                    pass
+                    class DummyMedium(Medium, dimensionality=dim, velocity_factor=vf):
+                        pass
 
-                self.assertEqual(DummyMedium._dimensionality, dimensionality)
+                    self.assertEqual(DummyMedium._dimensionality, dim)
+                    self.assertEqual(
+                        DummyMedium._medium_velocity_ns,
+                        vf * SPEED_OF_LIGHT / NANOSECONDS_PER_SECOND,
+                    )
 
+    def test__init_subclass__bad_dimensionality(self):
         # Dimensionality cannot be anything other than 1 or 3
         for dimensionality in (0, 2, 4):
             with self.subTest(dimensionality=dimensionality):
@@ -86,7 +235,22 @@ class TestMedium(TestPHYBase):
                     ValueError, '`dimensionality` must be 1 or 3'
                 ):
 
-                    class DummyMedium(Medium, dimensionality=dimensionality):
+                    class DummyMedium(
+                        Medium, dimensionality=dimensionality, velocity_factor=0.5
+                    ):
+                        pass
+
+    def test__init_subclass__bad_velocity_factor(self):
+        # Velocity factor outside of the range (0, 1] is not allowed.
+        for velocity_factor in (-1, 0, 2):
+            with self.subTest(velocity_factor=velocity_factor):
+                with self.assertRaisesRegex(
+                    ValueError, r'`velocity_factor` must be in range \(0, 1\]'
+                ):
+
+                    class DummyMedium(
+                        Medium, dimensionality=3, velocity_factor=velocity_factor
+                    ):
                         pass
 
     def test__new__(self):
@@ -102,13 +266,27 @@ class TestMedium(TestPHYBase):
 
     @patch.object(MockMedium, 'start')
     def test__init__(self, mock_start):
+        diameter = 100
+        max_baud = 1000
+        v_ns = MockMedium._medium_velocity_ns
+
         for auto_start in (True, False):
             with self.subTest(auto_start=auto_start):
-                medium = self.build_medium(auto_start=auto_start)
+                medium = self.build_medium(
+                    auto_start=auto_start, diameter=diameter, max_baud=max_baud
+                )
 
-                self.assertIsInstance(medium._tx_ingress_queue, Queue)
-                self.assertEqual(medium._receivers, {})
-                self.assertIsInstance(medium._receivers_lock, Lock)
+                self.assertEqual(medium._dimensionality, MockMedium._dimensionality)
+                self.assertEqual(medium._comms_details, {})
+                self.assertEqual(medium._last_transition_ns, 0)
+                self.assertEqual(medium._diameter, diameter)
+                self.assertEqual(
+                    (slot_ns := medium._slot_ns),
+                    NANOSECONDS_PER_SECOND // (32 * max_baud),
+                )
+                self.assertEqual(medium._buffer_size, ceil((diameter / v_ns) / slot_ns))
+
+                self.assertIsInstance(medium._comms_details_lock, Lock)
                 self.assertIsInstance(medium._connection_queue, Queue)
                 self.assertIsInstance(medium._stop_event, Event)
 
@@ -120,6 +298,18 @@ class TestMedium(TestPHYBase):
                 self.assertEqual(Medium._instances[MockMedium, medium.name], medium)
 
             mock_start.reset_mock()
+
+    def test__init__bad_diameter(self):
+        for diameter in (-1, 0):
+            with self.subTest(diameter=diameter):
+                with self.assertRaisesRegex(ValueError, '`diameter` must be positive'):
+                    self.build_medium(diameter=diameter)
+
+    def test__init__bad_max_baud(self):
+        for max_baud in (-1, 0):
+            with self.subTest(max_baud=max_baud):
+                with self.assertRaisesRegex(ValueError, '`max_baud` must be positive'):
+                    self.build_medium(max_baud=max_baud)
 
     def test__repr__(self):
         medium = self.build_medium()
@@ -160,12 +350,11 @@ class TestMedium(TestPHYBase):
                 self.assertIsNone(Medium._instances.get((MockMedium, medium.name)))
                 self.assertFalse(medium.is_alive())
 
-    # region run() tests
-
-    @patch(f'{BASE_TARGET}.Thread', autospec=True)
     @patch(f'{BASE_TARGET}.Event', autospec=True)
+    @patch(f'{BASE_TARGET}.monotonic_ns')
+    @patch(f'{BASE_TARGET}.Thread', autospec=True)
     @patch.object(MockMedium, '_process_medium')
-    def test_run(self, process_mock, EventMock, ThreadMock):
+    def test_run(self, process_mock, ThreadMock, montonic_mock, *mocks):
         medium = self.build_medium()
         medium._stop_event.is_set.side_effect = [False, True]
         mock_thread = ThreadMock.return_value
@@ -178,17 +367,17 @@ class TestMedium(TestPHYBase):
 
         ThreadMock.assert_called_once_with(
             target=medium._monitor_connections,
-            args=(
-                medium._connection_queue,
-                medium._receivers,
-                medium._receivers_lock,
-                medium._stop_event,
-            ),
         )
+
+        montonic_mock.assert_called_once()
+
+        self.assertEqual(medium._last_transition_ns, montonic_mock.return_value)
 
         process_mock.assert_called_once()
         mock_thread.start.assert_called_once()
         mock_thread.join.assert_called_once()
+
+    # region _monitor_connections
 
     @patch(f'{BASE_TARGET}.Event', autospec=True)
     @patch(f'{BASE_TARGET}.Queue', autospec=True)
@@ -205,7 +394,9 @@ class TestMedium(TestPHYBase):
         medium._stop_event.is_set.side_effect = [False, True]
 
         # Set up the new connection.
-        medium._connection_queue.get.return_value = (mock_conn, None, kwargs)
+        medium._connection_queue.get.return_value = creq = ConnRequest(
+            mock_conn, None, True, kwargs
+        )
 
         # Make the connection fail.
         err_str = 'Boom!'
@@ -213,10 +404,10 @@ class TestMedium(TestPHYBase):
 
         # Use this test to check the debug logs as well.
         with self.assertInTargetLogs('ERROR', f'{medium}: connection failed: {err_str}'):
-            self._run_monitor_connections(medium)
+            medium._monitor_connections()
 
         # Confirm that there was one connection and no disconnection.
-        connect_mock.assert_called_once_with(**kwargs)
+        connect_mock.assert_called_once_with(creq)
         mock_conn.send.assert_called_once_with((Responses.ERROR, err))
         disconnect_mock.assert_not_called()
 
@@ -224,11 +415,10 @@ class TestMedium(TestPHYBase):
     @patch(f'{BASE_TARGET}.Queue', autospec=True)
     @patch.object(MockMedium, '_disconnect')
     @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_add_connection_success(
+    def test_monitor_connections_add_connection_reply_fails(
         self, connect_mock, disconnect_mock, *mocks
     ):
         medium = self.build_medium()
-        location = 123
         mock_conn = Mock()
         kwargs = {'foo': 'bar'}
 
@@ -236,20 +426,58 @@ class TestMedium(TestPHYBase):
         medium._stop_event.is_set.side_effect = [False, True]
 
         # Set up the new connection.
-        medium._connection_queue.get.return_value = (mock_conn, None, kwargs)
-        connect_mock.return_value = location
+        medium._connection_queue.get.return_value = creq = ConnRequest(
+            mock_conn, None, True, kwargs
+        )
+        location = connect_mock.return_value
+
+        # Make the reply fail.
+        mock_conn.send.side_effect = Exception(err_str := 'Boom!')
+
+        # Use this test to check the debug logs as well.
+        with self.assertInTargetLogs(
+            'ERROR', f'{medium}: connection info reply to transceiver failed: {err_str}'
+        ):
+            medium._monitor_connections()
+
+        # Confirm that there was one connection and no disconnection.
+        connect_mock.assert_called_once_with(creq)
+        mock_conn.send.assert_called_once_with((Responses.OK, location))
+        disconnect_mock.assert_not_called()
+
+    @patch(f'{BASE_TARGET}.Event', autospec=True)
+    @patch(f'{BASE_TARGET}.Queue', autospec=True)
+    @patch(f'{BASE_TARGET}.CommsManager', autospec=True)
+    @patch.object(MockMedium, '_disconnect')
+    @patch.object(MockMedium, '_connect')
+    def test_monitor_connections_add_connection_success(
+        self, connect_mock, disconnect_mock, CommsManagerMock, *mocks
+    ):
+        medium = self.build_medium()
+        mock_conn = Mock()
+        kwargs = {'foo': 'bar'}
+
+        # Allow for one loop to perform a connection and then exit.
+        medium._stop_event.is_set.side_effect = [False, True]
+
+        # Set up the new connection.
+        medium._connection_queue.get.return_value = creq = ConnRequest(
+            mock_conn, None, True, kwargs
+        )
+        location = connect_mock.return_value
+        cmgr = CommsManagerMock.return_value
 
         # Use this test to check the debug logs as well.
         with self.assertInTargetLogs(
             'DEBUG',
             ['Starting connection worker thread', 'Connection worker thread exiting'],
         ):
-            self._run_monitor_connections(medium)
+            medium._monitor_connections()
 
         # Confirm that there was one connection and no disconnection.
-        connect_mock.assert_called_once_with(**kwargs)
+        connect_mock.assert_called_once_with(creq)
         mock_conn.send.assert_called_once_with((Responses.OK, location))
-        self.assertEqual(medium._receivers[location], mock_conn)
+        self.assertEqual(medium._comms_details[location], cmgr)
 
         disconnect_mock.assert_not_called()
 
@@ -263,13 +491,14 @@ class TestMedium(TestPHYBase):
         medium = self.build_medium()
         location = 123
 
-        medium._receivers[location] = mock_conn = Mock()
-
         # Allow for one loop to perform a disconnection and then exit.
         medium._stop_event.is_set.side_effect = [False, True]
 
-        # Set up the new connection.
-        medium._connection_queue.get.return_value = (None, location, None)
+        # Set up the existing connection.
+        medium._connection_queue.get.return_value = creq = ConnRequest(
+            None, location, False, None
+        )
+        medium._comms_details[location] = cmgr = Mock()
 
         # Make the disconnection fail.
         err_str = 'Boom!'
@@ -282,12 +511,12 @@ class TestMedium(TestPHYBase):
                 'removal.'
             ),
         ):
-            self._run_monitor_connections(medium)
+            medium._monitor_connections()
 
         # Confirm that there was one disconnection and no connection.
-        disconnect_mock.assert_called_once_with(location)
-        mock_conn.close.assert_called_once()
-        self.assertEqual(medium._receivers, {})
+        disconnect_mock.assert_called_once_with(creq)
+        cmgr.conn.close.assert_called_once()
+        self.assertEqual(medium._comms_details, {})
 
         connect_mock.assert_not_called()
 
@@ -301,20 +530,21 @@ class TestMedium(TestPHYBase):
         medium = self.build_medium()
         location = 123
 
-        medium._receivers[location] = mock_conn = Mock()
-
         # Allow for one loop to perform a disconnection and then exit.
         medium._stop_event.is_set.side_effect = [False, True]
 
-        # Set up the new connection.
-        medium._connection_queue.get.return_value = (None, location, None)
+        # Set up the existing connection.
+        medium._connection_queue.get.return_value = creq = ConnRequest(
+            None, location, False, None
+        )
+        medium._comms_details[location] = cmgr = Mock()
 
-        self._run_monitor_connections(medium)
+        medium._monitor_connections()
 
         # Confirm that there was one disconnection and no connection.
-        disconnect_mock.assert_called_once_with(location)
-        mock_conn.close.assert_called_once()
-        self.assertEqual(medium._receivers, {})
+        disconnect_mock.assert_called_once_with(creq)
+        cmgr.conn.close.assert_called_once()
+        self.assertEqual(medium._comms_details, {})
 
         connect_mock.assert_not_called()
 
@@ -322,163 +552,310 @@ class TestMedium(TestPHYBase):
     @patch(f'{BASE_TARGET}.Queue', autospec=True)
     def test_monitor_connections_got_bad_connection_request(self, *mocks):
         medium = self.build_medium()
+        medium._stop_event.is_set.return_value = True
 
-        # Allow for one loop to perform a get and then exit.
+        # Allow for one loop to perform a connection and then exit.
         medium._stop_event.is_set.side_effect = [False, True]
 
-        medium._connection_queue.get.return_value = bad_conn_details = 666
-
-        with self.assertInTargetLogs(
-            'ERROR', f'{medium}: unexpected connection format: {bad_conn_details}'
-        ):
-            self._run_monitor_connections(medium)
-
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    def test_process_medium_close_thread_received(self, *mocks):
-        medium = self.build_medium()
-        medium._tx_ingress_queue.get.return_value = CLOSE_MSG
-
-        medium._process_medium()
-
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    def test_process_medium_bad_transmission(self, *mocks):
-        medium = self.build_medium()
-        medium._tx_ingress_queue.get.return_value = bad_tx = 666
+        medium._connection_queue.get.return_value = 123
 
         with self.assertInTargetLogs(
             'ERROR',
-            (
-                f'{medium}: invalid transmission received ({bad_tx}). Format must be '
-                '(location, data)'
-            ),
+            f'{medium}: unexpected connection details type: int',
         ):
-            medium._process_medium()
+            medium._monitor_connections()
 
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_process_transmission', autospec=True)
-    def test_process_medium_transmission_error(self, process_transmission_mock, *mocks):
-        medium = self.build_medium()
+    # endregion
 
-        src_loc = 123
-        src_conn = Mock()
+    # region _process_medium-related
 
-        dest_loc = 456
-        dest_conn = Mock()
-
-        data = 'hello'
-        medium._tx_ingress_queue.get.return_value = (data, src_loc)
-
-        exc_str = 'A bad thing happened'
-        process_transmission_mock.side_effect = Exception(exc_str)
-
-        # Start by checking that the source is ignored.
-        medium._receivers = receivers = {src_loc: src_conn}
-
-        medium._process_medium()
-        process_transmission_mock.assert_not_called()
-
-        # Now add a viable destination such that the processing of the data is attempted.
-        receivers[dest_loc] = dest_conn
-
-        with self.assertInTargetLogs(
-            'ERROR',
-            (
-                f'{medium}: error processing transmission ({data=}, {src_loc=}, '
-                f'{dest_loc=}): {exc_str}'
-            ),
-        ):
-            medium._process_medium()
-
-        process_transmission_mock.assert_called_with(medium, data, src_loc, dest_loc)
-        dest_conn.send.assert_not_called()
-
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_process_transmission', autospec=True)
-    def test_process_medium_pipe_error(self, process_transmission_mock, *mocks):
-        medium = self.build_medium()
-
-        src_loc = 123
-        dest_loc = 456
-        dest_conn = Mock()
-
-        data = 'hello'
-        medium._tx_ingress_queue.get.return_value = (data, src_loc)
-
-        medium._receivers = {src_loc: None, dest_loc: dest_conn}
-        out_data = process_transmission_mock.return_value
-
-        exc_str = 'A bad thing happened'
-        dest_conn.send.side_effect = Exception(exc_str)
-
-        with self.assertInTargetLogs(
-            'ERROR',
-            f'{medium}: error sending data={out_data!r} to receiver at {dest_loc=}: {exc_str}',
-        ):
-            medium._process_medium()
-
-        dest_conn.send.assert_called_with(out_data)
-
-    @patch.object(MockMedium, '_disconnect')
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_connect')
-    @patch.object(MockMedium, '_process_transmission', autospec=True)
-    def test_monitor_connection_process_medium_integration(
-        self, process_transmission_mock, connect_mock, QueueMock, *mocks
+    @patch.object(MockMedium, '_process_tx_rx_events')
+    @patch(f'{BASE_TARGET}.monotonic_ns')
+    @patch.object(MockMedium, '_maybe_advance_rx_buffers')
+    def test_process_medium(
+        self, maybe_advance_rx_buffers_mock, monotonic_ns_mock, process_mock
     ):
-        # Simulate a sequence of:
-        # 1. A connection request.
-        # 2. A transmission sent from a source and received by a destination.
-        # 3. A disconnection request.
-        # 4. A transmission sent from a source and _not_ received by a destination.
-        tx_get_mock = Mock()
-        conn_get_mock = Mock()
-        QueueMock.side_effect = [tx_get_mock, conn_get_mock]
-
         medium = self.build_medium()
 
-        src_loc = 123
-        src_conn = Mock()
+        loc1 = 123
+        loc2 = 456
+
+        cmgr1 = Mock()
+        cmgr2 = Mock()
+
+        medium._comms_details = {loc1: cmgr1, loc2: cmgr2}
+
+        # Run _process_medium() confirming that we've collected the current time, that we
+        # have triggered a potential advancing of buffers and that each connection has
+        # been processed.
+        medium._process_medium()
+
+        current_ns = monotonic_ns_mock.return_value
+
+        monotonic_ns_mock.assert_called_once()
+        maybe_advance_rx_buffers_mock.assert_called_once_with(current_ns)
+        process_mock.assert_has_calls(
+            [call(loc1, cmgr1, current_ns), call(loc2, cmgr2, current_ns)]
+        )
+
+    def test_maybe_advance_rx_buffers(self):
+        medium = self.build_medium()
+
+        medium._last_transition_ns = orig_trans_ns = 100
+        medium._slot_ns = slot_ns = 300
+
+        with self.subTest('rx buffers not advanced'):
+            medium._maybe_advance_rx_buffers(orig_trans_ns + slot_ns - 1)
+
+            # Still in the same slot.
+            self.assertEqual(medium._last_transition_ns, orig_trans_ns)
+
+        loc1 = 123
+        loc2 = 456
+
+        cmgr1 = Mock()
+        cmgr2 = Mock()
+
+        medium._comms_details = {loc1: cmgr1, loc2: cmgr2}
+
+        medium._last_transition_ns = trans_ns = 100
+        medium._slot_ns = slot_ns = 300
+
+        with self.subTest('rx buffers advanced'):
+            with self.assertInTargetLogs(
+                'DEBUG', f'{medium}: crossed slot boundary, advancing rx buffers'
+            ):
+                medium._maybe_advance_rx_buffers(trans_ns + slot_ns)
+
+            self.assertEqual(medium._last_transition_ns, trans_ns + slot_ns)
+
+            for cmgr in (cmgr1, cmgr2):
+                cmgr.advance_rx_buffer.assert_called_once()
+
+    @patch.object(MockMedium, '_calculate_travel_time_ns')
+    def test_process_tx_rx_events(self, calc_travel_time_mock):
+        medium = self.build_medium()
+
+        current_ns = 500
+        loc = 123
+        cmgr = Mock(next_rx_ns=current_ns - 1, next_tx_ns=current_ns + 1)
+
+        cmgr.trigger_rx.side_effect = ConnectionError(err_str := 'test')
+
+        with self.subTest('rx triggered with error'):
+
+            with self.assertInTargetLogs(
+                'ERROR', f'{medium}: error while triggering rx: {err_str}'
+            ):
+                medium._process_tx_rx_events(loc, cmgr, current_ns)
+
+            cmgr.trigger_rx.assert_called_once()
+            cmgr.trigger_tx.assert_not_called()
+
+        cmgr.reset_mock()
+        cmgr.trigger_rx.side_effect = None
+
+        with self.subTest('rx triggered, tx not triggered'):
+            with self.assertInTargetLogs(
+                'DEBUG', f'{medium}: triggering rx at location={loc}'
+            ):
+                medium._process_tx_rx_events(loc, cmgr, current_ns)
+
+            cmgr.trigger_rx.assert_called_once()
+            cmgr.trigger_tx.assert_not_called()
+
+        cmgr.reset_mock()
+
+        medium._last_transition_ns = last_ns = 100
+
+        current_ns = 500
+        loc = 123
+        symbol = 0.5
+        ns_per_symbol = 100
+        next_tx_ns = current_ns - 1
+        cmgr.next_rx_ns = current_ns + 1
+        cmgr.next_tx_ns = next_tx_ns
+
+        tx_offset_ns = next_tx_ns - last_ns
+
         dest_loc = 456
+        dest_cmgr = Mock()
+        medium._comms_details = {dest_loc: dest_cmgr, loc: cmgr}
+
+        cmgr.trigger_tx.return_value = symbol, ns_per_symbol
+
+        with self.subTest('rx not triggered, tx triggered'):
+            with self.assertInTargetLogs(
+                'DEBUG',
+                [
+                    f'{medium}: transceiver at location={loc} transmitting {symbol=}',
+                    f'{medium}: adding {symbol=} to buffer for location={dest_loc}',
+                ],
+            ):
+                medium._process_tx_rx_events(loc, cmgr, current_ns)
+
+            cmgr.trigger_rx.assert_not_called()
+            cmgr.trigger_tx.assert_called_once()
+
+            calc_travel_time_mock.assert_called_once_with(loc, dest_loc)
+
+            # Also make sure that the destination connection manager's modify_buffer method
+            # has been called (but not the source's).
+            dest_cmgr.modify_buffer.assert_called_once_with(
+                symbol, tx_offset_ns + calc_travel_time_mock.return_value, ns_per_symbol
+            )
+            cmgr.modify_butter.assert_not_called()
+
+        cmgr.reset_mock()
+
+        cmgr.trigger_tx.side_effect = ConnectionError(err_str := 'test')
+
+        with self.subTest('tx triggered with error'):
+            with self.assertInTargetLogs(
+                'ERROR', f'{medium}: error while triggering tx: {err_str}'
+            ):
+                medium._process_tx_rx_events(loc, cmgr, current_ns)
+
+            cmgr.trigger_rx.assert_not_called()
+            cmgr.trigger_tx.assert_called_once()
+
+    def test_calculate_travel_time_ns(self):
+        medium = self.build_medium()
+        meters = medium._medium_velocity_ns
+
+        # Test for 1D and 3D, with each having been set up to have a distance equal to
+        # the number of meters that a signal travels per nanosecond in the medium.
+        locs = (((0, 0, 0), (0, 0, meters)), (0, meters))
+
+        for loc1, loc2 in locs:
+            with self.subTest(loc1=loc1, loc2=loc2):
+                self.assertEqual(medium._calculate_travel_time_ns(loc1, loc2), 1)
+
+    @patch(f'{BASE_TARGET}.monotonic_ns', autospec=True)
+    def test_transmission_and_reception(self, monotonic_mock, *mocks):
+        """
+        Simulate a transmission triggered in a source in the right time slot and received
+        by a destination in the right time slot.
+        """
+        medium = self.build_medium()
+        buff_size = medium._buffer_size
+        slot_ns = medium._slot_ns
+        empty_buffer = [0] * buff_size
+        symbol = 0.3
+        duration = 10 * slot_ns
+        duration_in_slots = ceil(duration / slot_ns)
+
+        # The details about the transceivers.
+        src_loc = 100
+        dest_loc = 105
+        src_conn = Mock()
         dest_conn = Mock()
 
-        medium._receivers = {src_loc: src_conn}
+        travel_time_ns = medium._calculate_travel_time_ns(src_loc, dest_loc)
 
-        data = 'hello'
-        tx_get_mock.get.return_value = (data, src_loc)
-        # An identity function is sufficient for this test.
-        process_transmission_mock.return_value = data
+        # Configure the connection managers such that all tx and rx events start at the
+        # beginning of the next slot except for the source transceiver's transmission,
+        # which will occur during the next run of _process_medium.
+        src_cmgr = CommsManager(src_conn, buff_size, slot_ns, slot_ns)
+        dest_cmgr = CommsManager(dest_conn, buff_size, slot_ns, slot_ns)
 
-        # Just to be sure, confirm that the destination connection doesn't get anything
-        # sent at this point.
+        monotonic_mock.return_value = current_time = slot_ns // 2
+        src_cmgr.next_tx_ns = src_tx_time = current_time - 1
+        dest_start_delay_slots = ceil((travel_time_ns + src_tx_time) / slot_ns)
+
+        # Configure the medium with the managers.
+        medium._comms_details = {src_loc: src_cmgr, dest_loc: dest_cmgr}
+
+        # Prepare the transmission.
+        src_conn.recv.return_value = (symbol, duration, slot_ns)
+
+        # Process the medium and confirm that the symbol was placed in the buffer of
+        # only the destination transceiver and with the correct slot offset and duration.
         medium._process_medium()
+
+        src_conn.send.assert_called_once_with((CommsType.TRANSMIT, None))
+        src_conn.recv.assert_called_once()
         dest_conn.send.assert_not_called()
+        dest_conn.recv.assert_not_called()
 
-        # Configure a connection request.
-        medium._stop_event.is_set.side_effect = [False, True]
-        conn_get_mock.get.return_value = (dest_conn, None, {})
-        connect_mock.return_value = dest_loc
+        # The confirm that the receive buffer of the source is still pristine.
+        self.assertEqual(src_cmgr._buffer._data, empty_buffer)
 
-        # Add the destination to the receivers.
-        self._run_monitor_connections(medium)
-        dest_conn.send.assert_called_once_with((Responses.OK, dest_loc))
+        # Meanwhile, the buffer for the destination has the symbol at the correct start
+        # slot and with the correct slot duration.
+        remainder_slots = buff_size - dest_start_delay_slots - duration_in_slots
+        self.assertEqual(
+            dest_cmgr._buffer._data,
+            (
+                [0] * dest_start_delay_slots
+                + [symbol] * duration_in_slots
+                + [0] * remainder_slots
+            ),
+        )
+
+        src_conn.reset_mock()
         dest_conn.reset_mock()
 
-        # Send the transmission another time. This time. the destination should receive
-        # it.
-        medium._process_medium()
-        dest_conn.send.assert_called_once_with(data)
+        # Walk through the slots right up until the one containing the beginning of the
+        # transmission reception at the destiantion and confirm that all transmissions and
+        # receptions are zeros.
+        for _ in range(dest_start_delay_slots - 1):
+            # Neither the source nor the destination will transmit during this time, but
+            # they will still be polled for their transmission and reception details.
+            src_conn.recv.side_effect = [slot_ns, (0, duration, slot_ns)]
+            dest_conn.recv.side_effect = [slot_ns, (0, duration, slot_ns)]
 
-        # Configure a disconnection request.
-        medium._stop_event.is_set.side_effect = [False, True]
-        conn_get_mock.get.return_value = (None, dest_loc, {})
+            current_time += slot_ns
+            monotonic_mock.return_value = current_time
 
-        # Remove the destination from the receivers.
-        self._run_monitor_connections(medium)
+            # Do the thing.
+            medium._process_medium()
 
-        # Send the transmission another time. This time, the destination should not
-        # receive it.
-        medium._process_medium()
+            for conn in (src_conn, dest_conn):
+                # Medium -> transceiver: one reception of a zero and one ping to transmit.
+                conn.send.assert_has_calls(
+                    [call((CommsType.RECEIVE, 0)), call((CommsType.TRANSMIT, None))]
+                )
+
+                # Transceiver -> medium: one reply with the next rx delta, one reply with
+                # the next symbol, duration and tx delta.
+                self.assertEqual(2, conn.recv.call_count)
+
+            src_conn.reset_mock()
+            dest_conn.reset_mock()
+
+        # Walk through the slots which include the transmission on the link and confirm
+        # that the receiver is receiving the correct symbol.
+        for _ in range(duration_in_slots):
+            # Neither the source nor the destination will transmit during this time, but
+            # they will still be polled for their transmission and reception details.
+            src_conn.recv.side_effect = [slot_ns, (0, duration, slot_ns)]
+            dest_conn.recv.side_effect = [slot_ns, (0, duration, slot_ns)]
+
+            current_time += slot_ns
+            monotonic_mock.return_value = current_time
+
+            # Do the thing.
+            medium._process_medium()
+
+            src_conn.send.assert_has_calls(
+                [
+                    call((CommsType.RECEIVE, 0)),
+                    call((CommsType.TRANSMIT, None)),
+                ]
+            )
+            self.assertEqual(2, src_conn.recv.call_count)
+
+            dest_conn.send.assert_has_calls(
+                [
+                    call((CommsType.RECEIVE, symbol)),
+                    call((CommsType.TRANSMIT, None)),
+                ]
+            )
+            self.assertEqual(2, dest_conn.recv.call_count)
+
+            src_conn.reset_mock()
+            dest_conn.reset_mock()
 
     # endregion
 
@@ -490,14 +867,12 @@ class TestMedium(TestPHYBase):
         medium = self.build_medium()
         medium._stop_event = stop_event = Mock()
         medium._connection_queue = conn_queue = Mock()
-        medium._tx_ingress_queue = tx_queue = Mock()
         medium.is_alive = Mock(return_value=True)
 
         medium.stop()
 
         stop_event.set.assert_called_once()
-        conn_queue.put.assert_called_once_with(CLOSE_MSG)
-        tx_queue.put.assert_called_once_with(CLOSE_MSG)
+        conn_queue.put.assert_called_once_with(ManagementMessages.CLOSE)
 
         join_mock.assert_called_once()
         terminate_mock.assert_called_once_with(medium)
@@ -519,16 +894,6 @@ class TestMedium(TestPHYBase):
         # We can still call stop a second time without raising an exception.
         medium.stop()
 
-    def test_transmit(self):
-        medium = self.build_medium()
-        medium._tx_ingress_queue = tx_queue = Mock()
-
-        data = 'hello'
-        src_loc = 123
-        medium.transmit(data, src_loc)
-
-        tx_queue.put.assert_called_once_with((data, src_loc))
-
     # endregion
 
 
@@ -540,37 +905,56 @@ class TestTransceiver(TestPHYBase):
 
     # region Dunders
 
-    def test__init_subclass__with_bad_media_types(self):
-        with self.assertRaises(TypeError):
+    def test__init_subclass__(self):
+        with self.subTest('with non-medium media'):
+            with self.assertRaises(TypeError):
 
-            class BadTransceiver(Transceiver, supported_media=[object]):
-                pass
+                class BadTransceiver1(Transceiver, supported_media=[object]):
+                    pass
 
-    def test__init_subclass__with_bad_media_dimensionalities(self):
         # Valid dimensionalities, but they differ and that's not allowed.
-        class DummyMedium1(Medium, dimensionality=1):
+        class DummyMedium1(Medium, dimensionality=1, velocity_factor=1):
             pass
 
-        class DummyMedium2(Medium, dimensionality=3):
+        class DummyMedium2(Medium, dimensionality=3, velocity_factor=1):
             pass
 
-        with self.assertRaisesRegex(
-            ValueError,
-            '`supported_media` must have the same number of dimensions.',
-        ):
+        with self.subTest('with media of different dimensionalities'):
+            with self.assertRaisesRegex(
+                ValueError,
+                '`supported_media` must have the same number of dimensions.',
+            ):
 
-            class BadTransceiver(
-                Transceiver, supported_media=[DummyMedium1, DummyMedium2]
+                class BadTransceiver2(
+                    Transceiver,
+                    supported_media=[DummyMedium1, DummyMedium2],
+                    buffer_bytes=10,
+                ):
+                    pass
+
+        with self.subTest('with non-positive integer buffer_bytes'):
+            with self.assertRaisesRegex(
+                ValueError, '`buffer_bytes` must be a positive integer.'
+            ):
+
+                class BadTransceiver3(
+                    Transceiver, supported_media=[MockMedium], buffer_bytes=0
+                ):
+                    pass
+
+        test_media = [MockMedium]
+        buffer_bytes = 20
+
+        with self.subTest('with valid arguments'):
+
+            class GoodTransceiver(
+                Transceiver, supported_media=test_media, buffer_bytes=buffer_bytes
             ):
                 pass
 
-    def test__init_subclass__with_good_media(self):
-        test_media = [MockMedium]
-
-        class GoodTransceiver(Transceiver, supported_media=test_media):
-            pass
-
-        self.assertEqual(GoodTransceiver._supported_media, test_media)
+            self.assertEqual(GoodTransceiver._supported_media, test_media)
+            self.assertEqual(list(GoodTransceiver._tx_buffer), [0] * buffer_bytes)
+            self.assertEqual(list(GoodTransceiver._rx_buffer), [0] * buffer_bytes)
 
     def test__new__(self):
         x1 = self.build_xcvr()
@@ -591,6 +975,8 @@ class TestTransceiver(TestPHYBase):
         osi_listener = Mock()
         osi_client = Mock()
 
+        base_baud = 1e6
+
         for auto_start in (True, False):
             PipeMock.side_effect = [
                 (mod_listener, mod_client),
@@ -598,7 +984,7 @@ class TestTransceiver(TestPHYBase):
             ]
             with self.subTest(auto_start=auto_start):
 
-                xcvr = self.build_xcvr(auto_start=auto_start)
+                xcvr = self.build_xcvr(auto_start=auto_start, base_baud=base_baud)
 
                 PipeMock.assert_has_calls(
                     [
@@ -608,8 +994,7 @@ class TestTransceiver(TestPHYBase):
                 )
 
                 self.assertIsNone(xcvr._medium)
-                self.assertIsNone(xcvr._tx_queue)
-                self.assertIsNone(xcvr._rx_conn)
+                self.assertEqual(xcvr._base_delta_ns, NANOSECONDS_PER_SECOND // base_baud)
                 self.assertEqual(xcvr._connections_listener, mod_listener)
                 self.assertEqual(xcvr._connections_client, mod_client)
                 self.assertEqual(xcvr.osi_listener, osi_listener)
@@ -633,25 +1018,29 @@ class TestTransceiver(TestPHYBase):
         for dimensionality in (1, 3):
             expected_location = 0.0 if dimensionality == 1 else (0.0, 0.0, 0.0)
 
-            class DummyMedium(Medium, dimensionality=dimensionality):
+            class DummyMedium(Medium, dimensionality=dimensionality, velocity_factor=1):
                 pass
 
-            class DummyTransceiver(Transceiver, supported_media=[DummyMedium]):
+            class DummyTransceiver(
+                Transceiver, supported_media=[DummyMedium], buffer_bytes=10
+            ):
                 def _connect(self, *args, **kwargs):
                     pass
 
                 def _disconnect(self, *args, **kwargs):
                     pass
 
-                def _process_incoming_data(self, *args, **kwargs):
+                def _process_rx_value(self, symbol):
                     pass
 
-                def _process_outgoing_data(self, data, *args, **kwargs):
+                def _next_tx_symbol(self):
                     pass
 
             with self.subTest(dimensionality=dimensionality):
                 self.assertEqual(
-                    DummyTransceiver(name='test', auto_start=False).location,
+                    DummyTransceiver(
+                        name='test', auto_start=False, base_baud=1e6
+                    ).location,
                     expected_location,
                 )
 
@@ -786,12 +1175,19 @@ class TestTransceiver(TestPHYBase):
         medium = self.build_medium(mocked=True, is_alive=True)
 
         err_str = 'foo'
-        medium._connection_queue.put.side_effect = OSError(err_str)
+        medium.connect.side_effect = OSError(err_str)
 
-        with self.assertRaisesRegex(
-            ConnectionError, f'Error sending connection request to {medium!r}: {err_str}'
-        ):
-            xcvr.connect(medium)
+        with patch(f'{BASE_TARGET}.Pipe', autospec=True) as PipeMock:
+            PipeMock.return_value = (None, medium_conn := Mock())
+
+            with self.assertRaisesRegex(
+                ConnectionError,
+                f'Error sending connection request to {medium!r}: {err_str}',
+            ):
+                xcvr.connect(medium)
+
+        medium.connect.assert_called_once_with(medium_conn)
+        PipeMock.assert_called_once_with(duplex=True)
 
     def test_connect_bad_recv(self):
         xcvr = self.build_xcvr(is_alive=True)
@@ -800,9 +1196,9 @@ class TestTransceiver(TestPHYBase):
         err_str = 'bar'
 
         with patch(f'{BASE_TARGET}.Pipe', autospec=True) as PipeMock:
-            PipeMock.return_value = (phy_listener := Mock(), None)
+            PipeMock.return_value = (xvcr_conn := Mock(), None)
 
-            phy_listener.recv.side_effect = OSError(err_str)
+            xvcr_conn.recv.side_effect = OSError(err_str)
 
             with self.assertRaisesRegex(
                 ConnectionError,
@@ -810,14 +1206,16 @@ class TestTransceiver(TestPHYBase):
             ):
                 xcvr.connect(medium)
 
+            xvcr_conn.recv.assert_called_once()
+
     def test_connect_bad_response_contents(self):
         xcvr = self.build_xcvr(is_alive=True)
         medium = self.build_medium(mocked=True, is_alive=True)
 
         with patch(f'{BASE_TARGET}.Pipe', autospec=True) as PipeMock:
-            PipeMock.return_value = (phy_listener := Mock(), None)
+            PipeMock.return_value = (xvcr_conn := Mock(), None)
 
-            phy_listener.recv.return_value = response = 'foo'
+            xvcr_conn.recv.return_value = response = 'foo'
 
             with self.assertRaisesRegex(
                 ConnectionError,
@@ -830,9 +1228,9 @@ class TestTransceiver(TestPHYBase):
         medium = self.build_medium(mocked=True, is_alive=True)
 
         with patch(f'{BASE_TARGET}.Pipe', autospec=True) as PipeMock:
-            PipeMock.return_value = (phy_listener := Mock(), None)
+            PipeMock.return_value = (xvcr_conn := Mock(), None)
 
-            phy_listener.recv.return_value = (
+            xvcr_conn.recv.return_value = (
                 (result := Responses.ERROR),
                 (details := 'foo'),
             )
@@ -852,7 +1250,6 @@ class TestTransceiver(TestPHYBase):
         # initializer...
         PipeMock.side_effect = [(None, conn_client_mock := Mock()), (None, None)]
 
-        self.medium_mock._connection_queue = conn_queue = Mock()
         self.medium_mock.is_alive.return_value = True
         xcvr = self.build_xcvr()
 
@@ -860,9 +1257,9 @@ class TestTransceiver(TestPHYBase):
         PipeMock.reset_mock()
 
         # ...and one more in the connect method.
-        PipeMock.side_effect = [(phy_listener_mock := Mock(), phy_client_mock := Mock())]
+        PipeMock.side_effect = [(xcvr_conn := Mock(), medium_conn := Mock())]
 
-        phy_listener_mock.recv.return_value = (Responses.OK, (location := 123))
+        xcvr_conn.recv.return_value = (Responses.OK, (location := 123))
 
         with patch.object(xcvr, 'is_alive', return_value=True):
             with self.assertInTargetLogs(
@@ -871,9 +1268,9 @@ class TestTransceiver(TestPHYBase):
                 xcvr.connect(self.medium_mock, **kwargs)
 
         connect_mock.assert_called_once_with(self.medium_mock, **kwargs)
-        PipeMock.assert_called_once_with(duplex=False)
-        conn_queue.put.assert_called_once_with((phy_client_mock, None, kwargs))
-        conn_client_mock.send.assert_called_once_with(phy_listener_mock)
+        PipeMock.assert_called_once_with(duplex=True)
+        self.medium_mock.connect.assert_called_once_with(medium_conn, **kwargs)
+        conn_client_mock.send.assert_called_once_with(xcvr_conn)
         self.assertEqual(xcvr._medium, self.medium_mock)
         self.assertEqual(xcvr.location, location)
 
@@ -900,8 +1297,6 @@ class TestTransceiver(TestPHYBase):
         PipeMock.side_effect = [(None, conn_client_mock := Mock), (None, None)]
         conn_client_mock.send = Mock()
 
-        self.medium_mock._connection_queue = conn_queue = Mock()
-
         # Build a pre-connected Transceiver.
         xcvr = self.build_xcvr()
         xcvr.location = location = 123
@@ -913,7 +1308,7 @@ class TestTransceiver(TestPHYBase):
             xcvr.disconnect()
 
         disconnect_mock.assert_called_once()
-        conn_queue.put.assert_called_once_with((None, location, None))
+        self.medium_mock.disconnect.assert_called_once_with(location)
         conn_client_mock.send.assert_called_once_with(None)
 
         self.assertIsNone(xcvr._medium)
@@ -930,7 +1325,7 @@ class TestTransceiver(TestPHYBase):
 
         PipeMock.side_effect = [
             (conn_listener_mock := Mock(), None),
-            (None, osi_client_mock := Mock()),
+            (None, None),
         ]
         EventMock.side_effect = [
             proc_stop_event := self.build_unique_mock('is_set'),
@@ -940,9 +1335,9 @@ class TestTransceiver(TestPHYBase):
         proc_stop_event.is_set.side_effect = [False, False, True]
 
         conn_listener_mock.recv.side_effect = [
-            phy_listener_mock := self.build_unique_mock('send'),  # connect
+            conn := self.build_unique_mock('send'),  # connect
             None,  # disconnect
-            CLOSE_MSG,  # thread stop
+            ManagementMessages.CLOSE,  # thread stop
         ]
 
         xcvr = self.build_xcvr()
@@ -959,134 +1354,186 @@ class TestTransceiver(TestPHYBase):
         thread_stop_event.clear.assert_called_once()
         ThreadMock.assert_called_once_with(
             target=xcvr._monitor_medium,
-            args=(
-                phy_listener_mock,
-                osi_client_mock,
-                thread_stop_event,
-            ),
+            args=(conn,),
         )
         mock_thread.start.assert_called_once()
 
         # Disconnect
         thread_stop_event.set.assert_called_once()
-        phy_listener_mock.send.assert_called_once_with(CLOSE_MSG)
+        conn.send.assert_called_once_with(ManagementMessages.CLOSE)
         mock_thread.join.assert_called_once()
 
-    @patch.object(MockTransceiver, '_process_incoming_data')
-    def test_monitor_medium_bad_recv(self, process_mock):
+    @patch.object(MockTransceiver, '_process_rx_value')
+    def test_process_reception_event(self, process_mock):
+        xcvr = self.build_xcvr()
+        conn = self.build_unique_mock('send')
+        value = 1.3
+
+        process_mock.side_effect = ValueError(err_str := 'bad process')
+
+        with self.subTest('Error raised'):
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{xcvr}: Error processing {value=}: {err_str}',
+            ):
+                xcvr._process_reception_event(conn, value)
+
+            conn.send.assert_called_once_with(xcvr._base_delta_ns)
+
+            process_mock.assert_called_once_with(value)
+
+        process_mock.reset_mock()
+        conn.send.reset_mock()
+        process_mock.side_effect = None
+        process_mock.return_value = delta = 123
+
+        with self.subTest('No error raised'):
+            xcvr._process_reception_event(conn, value)
+
+            conn.send.assert_called_with(delta)
+
+            process_mock.assert_called_once_with(value)
+
+    @patch.object(MockTransceiver, '_next_tx_symbol')
+    def test_process_transmission_event(self, next_mock):
+        xcvr = self.build_xcvr()
+        conn = self.build_unique_mock('send')
+
+        next_mock.side_effect = ValueError(next_err_str := 'bad next')
+        conn.send.side_effect = ValueError(send_err_str := 'bad send')
+
+        with self.subTest('Errors raised'):
+            with self.assertInTargetLogs(
+                'ERROR',
+                (
+                    f'{xcvr}: Error getting next symbol to transmit: {next_err_str}',
+                    f'{xcvr}: Error sending symbol=0 to medium: {send_err_str}',
+                ),
+            ):
+                xcvr._process_transmission_event(conn)
+
+            next_mock.assert_called_once()
+            conn.send.assert_called_once_with(0, xcvr._base_delta_ns, xcvr._base_delta_ns)
+
+        next_mock.reset_mock()
+        conn.send.reset_mock()
+        next_mock.side_effect = None
+        next_mock.return_value = symbol = 1
+
+        with self.subTest('No errors raised'):
+            xcvr._process_transmission_event(conn)
+
+            next_mock.assert_called_once()
+            conn.send.assert_called_once_with(
+                symbol, xcvr._base_delta_ns, xcvr._base_delta_ns
+            )
+
+    @patch(f'{BASE_TARGET}.Event', autospec=True)
+    @patch.object(MockTransceiver, '_process_reception_event')
+    @patch.object(MockTransceiver, '_process_transmission_event')
+    def test_monitor_medium(self, tx_mock, rx_mock, EventMock):
+        stop_event_mock = EventMock.return_value
         xcvr = self.build_xcvr()
 
-        # Prevent cross-talk between unit tests by explicitly setting the methods whose
-        # calls we're testing.
-        phy_listener_mock = self.build_unique_mock('recv', 'close')
-        osi_client_mock = self.build_unique_mock('send')
-        stop_event_mock = self.build_unique_mock('is_set')
+        conn = self.build_unique_mock('recv')
 
         stop_event_mock.is_set.side_effect = [False, True]
 
-        phy_listener_mock.recv.side_effect = ValueError(err_str := 'bad recv')
+        conn.recv.side_effect = ValueError(err_str := 'bad recv')
 
-        with self.assertInTargetLogs(
-            'ERROR',
-            f'{xcvr}: Error receiving data from medium: {err_str}',
-        ):
-            xcvr._monitor_medium(phy_listener_mock, osi_client_mock, stop_event_mock)
+        with self.subTest('Error raised during initial receive'):
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{xcvr}: Error receiving data from medium: {err_str}',
+            ):
+                xcvr._monitor_medium(conn)
 
-        phy_listener_mock.recv.assert_called_once()
-        process_mock.assert_not_called()
-        phy_listener_mock.close.assert_called_once()
+            conn.recv.assert_called_once()
+            conn.close.assert_called_once()
 
-    @patch.object(MockTransceiver, '_process_incoming_data')
-    def test_monitor_medium_bad_data(self, process_mock):
-        xcvr = self.build_xcvr()
+            self.assertEqual(stop_event_mock.is_set.call_count, 2)
 
-        # Prevent cross-talk between unit tests by explicitly setting the methods whose
-        # calls we're testing.
-        phy_listener_mock = self.build_unique_mock('recv', 'close')
-        osi_client_mock = self.build_unique_mock('send')
-        stop_event_mock = self.build_unique_mock('is_set')
+        conn.recv.reset_mock()
+        conn.close.reset_mock()
+        stop_event_mock.is_set.reset_mock()
+        conn.recv.side_effect = None
 
-        process_mock.side_effect = ValueError(err_str := 'bad data')
+        # A second call will throw an exception.
+        stop_event_mock.is_set.side_effect = [False]
+        conn.recv.return_value = ManagementMessages.CLOSE
 
+        with self.subTest('Close message received'):
+            xcvr._monitor_medium(conn)
+
+            conn.recv.assert_called_once()
+            conn.close.assert_called_once()
+
+            self.assertEqual(stop_event_mock.is_set.call_count, 1)
+
+        conn.recv.reset_mock()
+        conn.close.reset_mock()
+        stop_event_mock.is_set.reset_mock()
+
+        data = 123
+
+        conn.recv.return_value = data
         stop_event_mock.is_set.side_effect = [False, True]
 
-        phy_listener_mock.recv.return_value = data = 0
+        with self.subTest('Bad data sent from medium'):
+            with self.assertInTargetLogs(
+                'ERROR',
+                (
+                    f'{xcvr}: Received malformed communications event data from medium: '
+                    f'{data=}'
+                ),
+            ):
+                xcvr._monitor_medium(conn)
 
-        with self.assertInTargetLogs(
-            'ERROR',
-            f'{xcvr}: Error processing {data=}: {err_str}',
-        ):
-            xcvr._monitor_medium(phy_listener_mock, osi_client_mock, stop_event_mock)
+            conn.recv.assert_called_once()
+            conn.close.assert_called_once()
 
-        phy_listener_mock.recv.assert_called_once()
-        process_mock.assert_called_once_with(data)
-        osi_client_mock.send.assert_not_called()
-        self.assertEqual(stop_event_mock.is_set.call_count, 2)
-        phy_listener_mock.close.assert_called_once()
+            self.assertEqual(stop_event_mock.is_set.call_count, 2)
 
-    @patch.object(MockTransceiver, '_process_incoming_data')
-    def test_monitor_medium_bad_send(self, process_mock):
-        xcvr = self.build_xcvr()
+        conn.recv.reset_mock()
+        conn.close.reset_mock()
+        stop_event_mock.is_set.reset_mock()
 
-        # Prevent cross-talk between unit tests by explicitly setting the methods whose
-        # calls we're testing.
-        phy_listener_mock = self.build_unique_mock('recv', 'close')
-        osi_client_mock = self.build_unique_mock('send')
-        stop_event_mock = self.build_unique_mock('is_set')
-
-        process_mock.return_value = out_data = 'blue'
-
+        conn.recv.return_value = CommsType.RECEIVE, data
         stop_event_mock.is_set.side_effect = [False, True]
 
-        phy_listener_mock.recv.return_value = in_data = 'red'
+        with self.subTest('Receive event'):
+            xcvr._monitor_medium(conn)
 
-        osi_client_mock.send.side_effect = OSError(err_str := 'bad send')
+            conn.recv.assert_called_once()
+            conn.close.assert_called_once()
 
-        with self.assertInTargetLogs(
-            'ERROR',
-            f'{xcvr}: Error sending data={out_data!r} to next layer up: {err_str}',
-        ):
-            xcvr._monitor_medium(phy_listener_mock, osi_client_mock, stop_event_mock)
+            self.assertEqual(stop_event_mock.is_set.call_count, 2)
 
-        phy_listener_mock.recv.assert_called_once()
-        process_mock.assert_called_once_with(in_data)
-        osi_client_mock.send.assert_called_once_with(out_data)
-        self.assertEqual(stop_event_mock.is_set.call_count, 2)
-        phy_listener_mock.close.assert_called_once()
+            rx_mock.assert_called_once_with(conn, data)
+            tx_mock.assert_not_called()
+
+        conn.recv.reset_mock()
+        conn.close.reset_mock()
+        stop_event_mock.is_set.reset_mock()
+        rx_mock.reset_mock()
+
+        conn.recv.return_value = CommsType.TRANSMIT, data
+        stop_event_mock.is_set.side_effect = [False, True]
+
+        with self.subTest('Transmit event'):
+            xcvr._monitor_medium(conn)
+
+            conn.recv.assert_called_once()
+            conn.close.assert_called_once()
+
+            self.assertEqual(stop_event_mock.is_set.call_count, 2)
+
+            tx_mock.assert_called_once_with(conn)
+            rx_mock.assert_not_called()
 
     # endregion
 
     # region other public methods
-
-    def test_transmit_not_started(self):
-        xcvr = self.build_xcvr()
-
-        with self.assertRaisesRegex(
-            ProcessNotRunningError,
-            'Transceiver must be running before transmitting data',
-        ):
-            xcvr.transmit(0)
-
-    def test_transmit_no_medium(self):
-        xcvr = self.build_xcvr(is_alive=True)
-
-        with self.assertRaisesRegex(
-            NoMediumError,
-            'Cannot transmit data without a medium',
-        ):
-            xcvr.transmit(0)
-
-    @patch.object(MockTransceiver, '_process_outgoing_data')
-    def test_transmit(self, process_mock):
-        xcvr = self.build_xcvr(is_alive=True, mock_medium=True)
-
-        in_data = 'red'
-        process_mock.return_value = out_data = 'blue'
-
-        xcvr.transmit(in_data)
-
-        process_mock.assert_called_once_with(in_data)
-        xcvr._medium.transmit.assert_called_once_with(out_data, xcvr.location)
 
     @patch(f'{BASE_TARGET}.Event', autospec=True)
     @patch(f'{BASE_TARGET}.Pipe', autospec=True)
@@ -1106,7 +1553,7 @@ class TestTransceiver(TestPHYBase):
 
         stop_event_mock.set.assert_called_once()
         try:
-            conn_client_mock.send.assert_called_once_with(CLOSE_MSG)
+            conn_client_mock.send.assert_called_once_with(ManagementMessages.CLOSE)
         except AssertionError:
             raise
 

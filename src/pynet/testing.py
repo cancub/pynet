@@ -88,7 +88,15 @@ class ProcessBuilderMixin:
     medium_cls: type[Medium] = None
     xcvr_cls: type[Transceiver] = None
 
-    def build_medium(self, name=None, mocked=False, auto_start=False, is_alive=None):
+    def build_medium(
+        self,
+        name=None,
+        mocked=False,
+        auto_start=False,
+        max_baud=10e6,
+        diameter=500,
+        is_alive=None,
+    ):
         # Make sure that we have a unique name for each medium
         name = name or f'test_{len(Medium._instances)}'
 
@@ -97,7 +105,9 @@ class ProcessBuilderMixin:
             medium.name = name
             medium._connection_queue = Mock()
         else:
-            medium = self.medium_cls(name=name, auto_start=auto_start)
+            medium = self.medium_cls(
+                name=name, max_baud=max_baud, diameter=diameter, auto_start=auto_start
+            )
 
         if is_alive is not None:
             medium.is_alive = Mock(return_value=is_alive)
@@ -107,6 +117,7 @@ class ProcessBuilderMixin:
     def build_xcvr(
         self,
         name=None,
+        base_baud=2e6,
         mocked=False,
         location=None,
         auto_start=False,
@@ -120,7 +131,7 @@ class ProcessBuilderMixin:
             xcvr = Mock(spec=self.xcvr_cls)
             xcvr.name = name
         else:
-            xcvr = self.xcvr_cls(name=name, auto_start=auto_start)
+            xcvr = self.xcvr_cls(name=name, base_baud=base_baud, auto_start=auto_start)
 
         if location is not None:
             xcvr.location = location

@@ -16,7 +16,3 @@ class ProcessNotRunningError(Exception):
 
 class ConnectionError(Exception):
     pass
-
-
-class NoMediumError(ConnectionError):
-    pass
