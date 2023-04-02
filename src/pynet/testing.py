@@ -93,8 +93,6 @@ class ProcessBuilderMixin:
         name=None,
         mocked=False,
         auto_start=False,
-        max_baud=10e6,
-        diameter=500,
         is_alive=None,
     ):
         # Make sure that we have a unique name for each medium
@@ -105,9 +103,7 @@ class ProcessBuilderMixin:
             medium.name = name
             medium._connection_queue = Mock()
         else:
-            medium = self.medium_cls(
-                name=name, max_baud=max_baud, diameter=diameter, auto_start=auto_start
-            )
+            medium = self.medium_cls(name=name, auto_start=auto_start)
 
         if is_alive is not None:
             medium.is_alive = Mock(return_value=is_alive)

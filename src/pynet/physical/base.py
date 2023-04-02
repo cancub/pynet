@@ -7,13 +7,6 @@ how data is transmitted over the media.
 :author: Alf O'Kenney
 
 TODO:
-- allow for a broad range of transmissions by refactoring the transmission of the
-  Transceiver to accept
-    - the duration of the transmission of a symbol
-    - one of
-        - a constant value (int or float)
-        - a function whose input is the time since the beginning of the transmission of
-            the symbol and whose output is the value of the signal at that time
 - allow users to specify the clock frequency of the transceivers
 - allow users to specify a PLL for transceivers
 - implement subclass abstract base classes for electrical and optical media
@@ -31,11 +24,10 @@ import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from functools import lru_cache
-from math import ceil
 from multiprocessing import Array, Event, Lock, Pipe, Process, Queue, Value
 from threading import Thread
 from time import monotonic_ns
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 from weakref import WeakValueDictionary
 
 from .constants import (
@@ -47,8 +39,7 @@ from .constants import (
     CommsType,
     Responses,
 )
-from .exceptions import ConnectionError, ProcessNotRunningError
-from .utils import RingBuffer
+from .exceptions import ConnectionError, ProcessNotRunningError, TransmissionComplete
 from ..space import euclidean_distance
 
 if TYPE_CHECKING:
@@ -64,31 +55,64 @@ log = logging.getLogger(__name__)
 ConnRequest = namedtuple('ConnRequest', ['conn', 'location', 'create', 'kwargs'])
 
 
+class Transmission:
+    """A class for describing a transmission with respect to two :class:`Transceiver`
+    objects."""
+
+    def __init__(
+        self, symbol_fn: Callable, start_ns: float, duration_ns: float, attenuation: float
+    ):
+        """
+        :param symbol_fn: A function that takes a single argument, the time since the
+            start of the transmission, and returns the amplitude of the symbol at that
+            time.
+        :param start_ns: The global time (in nanoseconds) at which the transmission
+            begins.
+        :param duration_ns: The duration of the transmission in nanoseconds.
+        :param attenuation: The attenuation of the transmission at the reference point
+            associated with the reception of the transmission.
+        """
+        self._symbol_fn = symbol_fn
+        self._start_ns = start_ns
+        self._stop_ns = start_ns + duration_ns
+        self._attenuation = attenuation
+
+    def get_amplitude(self, time_ns: float) -> float:
+        """Read the amplitude of the symbol at a given time.
+
+        :param time_ns: The time in nanoseconds at which to read the amplitude.
+
+        :returns: The amplitude of the signal at the given time.
+        """
+        if time_ns < self._start_ns:
+            return 0
+        if time_ns >= self._stop_ns:
+            raise TransmissionComplete
+
+        # We need to de-dilate the time to get the correct amplitude because the main
+        # medium process is sampling at a slower rate than the transceivers would be in
+        # real life. That is, the difference between the start time and the current time
+        # is TIME_DILATION_FACTOR times larger than it would be in real life.
+        actual_ns = (time_ns - self._start_ns) / TIME_DILATION_FACTOR
+        return self._symbol_fn(actual_ns) * self._attenuation
+
+
 class CommsManager:
     """A container for managing the relationship between a :class:`Transceiver` and a
     :class:`Medium` which the latter uses to trigger all communications (i.e., both TX and
     RX) with the former.
     """
 
-    def __init__(self, conn: Connection, buff_size: int, slot_ns: int, init_ns: int):
+    def __init__(self, conn: Connection, init_ns: float):
         """
         :param conn: The :class:`Medium`'s :class:`.Connection` of the :class:`.Pipe`
             between itself and a :class:`Transceiver`.
-        :param buff_size: The size of the rx buffer that will store the signal to be
-            received by a :class:`Transceiver`.
-        :param slot_ns: The duration in nanoseconds of each sample in the quantized
-            :class:`Medium`.
         :param init_ns: The initial time in nanoseconds at which a :class:`Transceiver`
-            is to begin transmitting and receiving.
+            is to begin receiving.
         """
         self._conn: Connection = conn
+        self._transmissions: set[Transmission] = set()
 
-        # Create the buffer for the symbols to be received by the transceiver.
-        self._buffer: RingBuffer = RingBuffer(size=buff_size, default=0)
-
-        self._slot_ns: int = slot_ns
-
-        self.next_tx_ns = init_ns
         self.next_rx_ns = init_ns
 
     def _send(self, data: Any) -> None:
@@ -118,93 +142,76 @@ class CommsManager:
                 f'Could not receive data from the Transceiver via {self}: {e}'
             )
 
-    def trigger_tx(self) -> tuple[float, float]:
+    def trigger_tx(self) -> tuple[Callable | None, float]:
         """Ping the :class:`Transceiver` to transmit a symbol and wait for a response
-        containing the symbol to be transmitted and the symbol rate (in symbols per
-        nanosecond) at which the symbol will be transmitted.
+        containing the function describing the symbol to be transmitted and the duration
+        of the symbol in nanoseconds.
 
-        :returns: The symbol to be transmitted and the duration in nanoseconds for the
-            symbol to be put on the link.
-
-        NOTE:
-        The actual duration of the symbol on the link is time-dilated in order to allow
-        the simulation to not trip over itself.
-
-        TODO:
-        gracefull recover from an exception by using a 0 symbol and the previous values
-        for rate and delta. This will likely result in a loss of data, but it will prevent
-        the simulation from crashing.
+        :returns: A tuple containing:
+            - a function describing the amplitude of a symbol over time
+            - the duration in nanoseconds for the symbol to be put on the link.
         """
         self._send((CommsType.TRANSMIT, None))
 
-        # The transceiver will respond with three pieces of information:
-        #   1. the symbol to be transmitted
-        #   2. the symbol duration in nanoseconds
-        #   3. the delta time to the next tx event
-        symbol, duration_ns, tx_delta_ns = self._recv()
-
-        # Update the next tx time.
-        # NOTE:
-        # The transceiver may no longer have any symbols to transmit, but we still
-        # schedule it to transmit a symbol in the next time slot so that it keeps pace
-        # with the medium. Technically a lack of a symbol to tansmit is the same as
-        # transmitting a zero, so this is not a problem.
-        self.next_tx_ns += tx_delta_ns * TIME_DILATION_FACTOR
-
-        return symbol, duration_ns * TIME_DILATION_FACTOR
+        return self._recv()
 
     def trigger_rx(self):
-        """Send the next symbol in the rx buffer to the :class:`Transceiver`.
+        """Send the summation of the various symbol amplitudes at this time to the
+        :class:`Transceiver`.
 
         TODO:
         Gracefully recover from an exception by using the previous delta time.
         """
-        self._send((CommsType.RECEIVE, self._buffer.get_current()))
+        # Collect the summation of the current amplitudes of all of the transmissions.
+        amplitude = 0.0
+
+        # Work with a shallow copy so that we can remove transmissions from the original
+        # set as we go.
+        for tx in self._transmissions.copy():
+            try:
+                amplitude += tx.get_amplitude(self.next_rx_ns)
+            except TransmissionComplete:
+                # The transmission has finished, so we must remove it from the set.
+                self._transmissions.remove(tx)
+            except Exception as e:
+                # Leave the transmission in the set and log the error. The transmission
+                # class itself will tell us when it's time to remove it.
+                log.error(
+                    f'{self}: an exception occurred while processing a transmission: {e}'
+                )
+
+        self._send((CommsType.RECEIVE, amplitude))
 
         # The transceiver will respond with the delta time to the next rx event.
         rx_delta_ns = self._recv()
 
         # Update the next rx time.
+        # NOTE:
+        # We need to scale up the time to allow us to operate at a slower rate than the
+        # transceivers would be in real life. Don't worry, the Transmission object will
+        # scale back down again when it reads from the symbol function.
         self.next_rx_ns += rx_delta_ns * TIME_DILATION_FACTOR
 
-    def advance_rx_buffer(self):
-        """Used by the :class:`Transceiver` to push out oldest symbol from the rx buffer
-        and add in a zero represnting dead air."""
-        self._buffer.shift()
+    def add_transmission(
+        self,
+        symbol_fn: Callable,
+        start_ns: float,
+        duration_ns: float,
+        attenuation: float = 1.0,
+    ):
+        """Used by the :class:`Medium` to update the set of transmissions to be received
+        by the :class:`Transceiver`.
 
-    def modify_buffer(self, symbol: int | float, start_delay_ns=float, duration_ns=float):
-        """Used by the :class:`Medium` to modify certain slots of the rx buffer.
-
-        :param symbol: The symbol to be added to the rx buffer.
-        :param start_delay_ns: The time (in nanoseconds) after the start of the current
-            slot that the wavefront appears at the :class:`Transceiver` represented by
-            this :class:`CommsManager` object.
-        :param duration_ns: The number of nanoseconds per symbol (the inverse of
-            the symbol rate).
+        :param symbol_fn: A function that takes a single argument the time since the start
+            of the transmission and returns the amplitude of the signal at that time.
+        :param start_ns: The global time in nanoseconds at which the transmission begins.
+        :param duration_ns: The duration of the transmission in nanoseconds.
+        :param attenuation: The attenuation of the transmission once it reaches the
+            :class:`Transceiver`.
         """
-        # The index in the rx buffer where we should begin adding symbol.
-        start_index = self._duration_in_slots(start_delay_ns)
-
-        # The number of times a symbol will transition from one time slot to another. In
-        # other words, the number of times we see the symbol on the link during samples of
-        # our quantized medium.
-        slots = self._duration_in_slots(duration_ns)
-
-        self._buffer.overlay([symbol] * slots, start_index)
-
-    @lru_cache
-    def _duration_in_slots(self, duration_ns=float) -> int:
-        """Get the number of samples in the quantized :class:`Medium` that will occur in
-        the given number of nanoseconds.
-
-        TODO:
-        A future optimization may be to just build a lookup table for this when the
-        :class:`Medium` is initialized.
-
-        :param duration_ns: The number of nanoseconds to be converted to time slots.
-        :return: The number of time slots that the given number of nanoseconds.
-        """
-        return ceil(duration_ns / self._slot_ns)
+        self._transmissions.add(
+            Transmission(symbol_fn, start_ns, duration_ns, attenuation)
+        )
 
 
 class Medium(Process, ABC):
@@ -256,8 +263,8 @@ class Medium(Process, ABC):
 
         :param dimensionality: The number of dimensions in which the medium exists. For
             example, coaxial cable is 1D, while free space/air is 3D.
-        :param max_baud: The maximum number of symbols per second that can be
-            transmitted over the medium. Measurements are in symbols per second (baud).
+        :param velocity_factor: The ratio of the speed of a wave propagating along the
+            medium to the speed of light. Must be in range (0, 1].
         """
         super().__init_subclass__()
         if dimensionality not in (1, 3):
@@ -280,23 +287,14 @@ class Medium(Process, ABC):
         cls._instances[cls, name] = obj
         return obj
 
-    def __init__(self, name: str, max_baud: int, diameter: int, auto_start: bool = True):
+    def __init__(self, name: str, auto_start: bool = True):
         """Initialize a :class:`Medium` instance.
 
         :param name: The name of the medium. This is used to identify the medium when
             connecting :class:`Transceiver` instances to it.
-        :param max_baud: The maximum number of symbols per second that will be
-            transmitted over the medium. Measurements are in symbols per second (baud).
-        :param diameter: The maximum distance between devices using the medium.
-            Measurements are in meters.
         :param auto_start: Whether or not to automatically start the process when the
             instance is created. Defaults to ``True``.
         """
-        if max_baud <= 0:
-            raise ValueError('`max_baud` must be positive')
-        if diameter <= 0:
-            raise ValueError('`diameter` must be positive')
-
         super().__init__()
 
         self.name = name
@@ -308,10 +306,6 @@ class Medium(Process, ABC):
         self._comms_details: dict[Location, CommsManager] = {}
         self._comms_details_lock: Lock = Lock()
 
-        # We must keep track of the last time we shifted buffers. This is to ensure that
-        # we don't shift buffers more than once per symbol.
-        self._last_transition_ns: int = 0
-
         # The Queue monitored by the worker thread for updates to state of connected
         # Transceivers.
         self._connection_queue: Queue = Queue()
@@ -320,45 +314,11 @@ class Medium(Process, ABC):
         # workers.
         self._stop_event: Event = Event()
 
-        # The maximum distance between devices using the medium. Measurements are in
-        # meters.
-        self._diameter: float = diameter
-
-        # The first things we need to recognize is that we can't actually have a medium
-        # object that manages continuous waveform. By constructing a medium with a program
-        # that operates in discrete time steps, the best we can do is represent waveforms
-        # as a series of discrete samples. This being the case, we need to consider how to
-        # ensure that we accurately store any signal. Thankfully, we can reference the
-        # Nyquist-Shannon sampling theorem, which states that we can avoid aliasing by
-        # sampling at twice the maximum frequency of the waveform. In our case, it would
-        # be nice to allow for simulation things like clock drift(?), where receivers will
-        # need to adjust their sampling rate to match the sender's phase. So, we'll go
-        # above and beyond the requirement to avoid aliasing and sample at 32 times the
-        # maximum baud rate.
-        # TODO:
-        # Allow users to configure this?
-        sample_rate = 32 * max_baud
-
-        # Given this sample rate, how many seconds would there be between samples? In
-        # other words, how many nanoseconds does each slot of a buffer represent?
-        #   (ns / s) / (sample / s) = ns / sample
-        self._slot_ns = NANOSECONDS_PER_SECOND // sample_rate
-
-        # There's no need to store information any longer than we need to, and we can
-        # determine the minimum buffer size by calculating the number of slots to required
-        # to cover the maximum distance of the medium.
-        # NOTE:
-        # We can understand this as a sort of analog to measuring distance in light-years.
-        # A light-year is unit of measurement that is equal to the distance that light
-        # travels in one year. In our case, we're looking at the distance that a signal
-        # in one slot in our medium and using that to measure the number of slots from one
-        # end of the medium to the other.
-        #   diameter_in_meters / meters_per_ns = ns_to_travese_medium
-        #   ns_to_traverse_medium / ns_per_slot = number of slots to traverse medium
-        self._buffer_size: int = (
-            ceil((diameter / self._medium_velocity_ns) / self._slot_ns)
-            * TIME_DILATION_FACTOR
-        )
+        # At any given moment, one or more Transceivers may be transmitting a signal. We
+        # need to keep track of the completion times of these signals in order to:
+        #   1. avoid unnecessary polling of transceivers that are already transmitting
+        #   2. replace a completed symbol transmission with a new one (if available)
+        self._transmission_completion_times: dict[CommsManager, int] = {}
 
         # By default, we do the caller the service of starting up the Process rather than
         # making them remember to do it for each and every Medium instance.
@@ -409,9 +369,6 @@ class Medium(Process, ABC):
         self._connection_thread = Thread(target=self._monitor_connections)
         self._connection_thread.start()
 
-        # Start tracking the last time we shifted buffers.
-        self._last_transition_ns = monotonic_ns()
-
         # Run the main loop.
         while not self._stop_event.is_set():
             self._process_medium()
@@ -461,14 +418,7 @@ class Medium(Process, ABC):
             conn.send((Responses.ERROR, e))
             return
 
-        # Create a new CommsManager for this connection and configure it to begin sending
-        # and receiving data in the next slot.
-        new_cmgr = CommsManager(
-            conn,
-            self._buffer_size,
-            self._slot_ns,
-            self._last_transition_ns + self._slot_ns,
-        )
+        new_cmgr = CommsManager(conn, monotonic_ns())
 
         # Send the location back to the transceiver.
         try:
@@ -507,33 +457,16 @@ class Medium(Process, ABC):
 
     def _process_medium(self):
         """Process the transceivers for transmission events and medium sampling, storing
-        samples of the transmissions in the applicable buffers with the applicable delays.
+        transmission signal functions in the applicable receivers with the applicable
+        delays.
         """
         # Get and store current time in nanoseconds.
         current_ns = monotonic_ns()
-
-        self._maybe_advance_rx_buffers(current_ns)
 
         # Process receptions and transmissions
         with self._comms_details_lock:
             for loc, cmgr in self._comms_details.items():
                 self._process_tx_rx_events(loc, cmgr, current_ns)
-
-    def _maybe_advance_rx_buffers(self, current_ns: int):
-        """If the current time is greater than the next slot boundary, advance the buffers
-        of all :class:`Transceiver`s and update the last transition time.
-
-        :param current_ns: The current time in nanoseconds.
-        """
-        if current_ns - self._last_transition_ns < self._slot_ns:
-            return
-
-        log.debug(f'{self}: crossed slot boundary, advancing rx buffers')
-        self._last_transition_ns += self._slot_ns
-
-        with self._comms_details_lock:
-            for cmgr in self._comms_details.values():
-                cmgr.advance_rx_buffer()
 
     def _process_tx_rx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
         """Process the transmission and reception events for a single
@@ -552,45 +485,63 @@ class Medium(Process, ABC):
             except ConnectionError as e:
                 log.error(f'{self}: error while triggering rx: {e}')
 
-        # Check if the scheduled time for the next transmission event for this transceiver
-        # has passed.
-        if (tx_ns := cmgr.next_tx_ns) > current_ns:
-            # Nothing to transmit yet in this time slot, so we can exit early.
-            return
-
-        # We need to pay attention to the time at which the transceiver is _scheduled_ to
-        # transmit, not the current time. This value affects the slot offsets for the
-        # buffers in all other transceivers.
-        tx_offset_ns = tx_ns - self._last_transition_ns
-
-        # Get the symbol that the transceiver is scheduled to transmit at this time slot
-        # as well as the time it takes for the transmitter to put a symbol on the link.
+        # Check if the transceiver had been transmitting and if the transmission has
+        # finished.
         try:
-            symbol, duration_ns = cmgr.trigger_tx()
+            stop_time_ns = self._transmission_completion_times[cmgr]
+        except KeyError:
+            # The transceiver is not transmitting, so we can assume that if it has
+            # anything to transmit, it just started.
+            start_ns = current_ns
+        else:
+            # The transceiver had been transmitting. Now we need to check if it has
+            # completed the transmission of the symbol.
+            if stop_time_ns <= current_ns:
+                del self._transmission_completion_times[cmgr]
+
+                # If there is another symbol to transmit, we need to schedule the
+                # transmission of that symbol immediately after the end of the current
+                # transmission.
+                start_ns = stop_time_ns
+            else:
+                # The transceiver is still transmitting.
+                return
+
+        # Check if the transceiver has any symbols to transmit.
+        try:
+            symbol_info = cmgr.trigger_tx()
         except ConnectionError as e:
             log.error(f'{self}: error while triggering tx: {e}')
             return
 
-        log.debug(f'{self}: transceiver at location={loc} transmitting {symbol=}')
+        if symbol_info is None:
+            # The transceiver has nothing to transmit.
+            return
 
-        # Add the symbol to the buffer of all other transceivers.
-        # NOTE: we already have the lock, so no need to obtain it again.
+        # Oh, it's transmitting, alright.
+        symbol_fn, duration_ns = symbol_info
+
+        log.debug(
+            f'{self}: transceiver at location={loc} beginning transmission of new symbol'
+        )
+
+        # Keep track of the transmission so that we can check if it has finished.
+        self._transmission_completion_times[cmgr] = start_ns + duration_ns
+
+        # Add the symbol to the set of transmission functions of each of the other
+        # transceivers.
         for dest_loc, dest_cmgr in self._comms_details.items():
             if dest_cmgr is cmgr:
                 continue
 
-            # Add the symbol to the buffer associated with the destination, accounting for
-            #   1. the delay from the start of the time slot to the time at which the
-            #      transceiver is scheduled to transmit
-            #   2. the travel time between the two transceivers
-            #   3. the rate at which the source transceiver is transmitting
-            # With 1 and 2 accounting for when the symbol is received by the destination
-            # transceiver, and 3 accounting for how long the symbol is on the link.
-            log.debug(f'{self}: adding {symbol=} to buffer for location={dest_loc}')
-            dest_cmgr.modify_buffer(
-                symbol,
-                tx_offset_ns + self._calculate_travel_time_ns(loc, dest_loc),
+            # TODO:
+            # Allow for a calculation of signal attenuation based on distance.
+            log.debug(f'{self}: adding transmission to set for location={dest_loc}')
+            dest_cmgr.add_transmission(
+                symbol_fn,
+                start_ns + self._calculate_travel_time_ns(loc, dest_loc),
                 duration_ns,
+                1,  # No attenuation for now.
             )
 
     @classmethod
@@ -736,10 +687,9 @@ class Transceiver(Process, ABC):
         self.name: str = name
         self._medium: Medium = None
 
-        # The base time delta between symbols nanoseconds. We _always_ transmit in
-        # in intervals of this value we _start_ to receive symbols at intervals of this
-        # value. The receiving delta could float up or down depending on the algorithm
-        # used to detect the rate/phase of the incoming signal.
+        # The base time delta between symbols nanoseconds. We start to receive symbols at
+        # intervals of this value. The receiving delta could float up or down depending on
+        # the algorithm used to detect the rate/phase of the incoming signal.
         self._base_delta_ns: int = NANOSECONDS_PER_SECOND // base_baud
 
         # The type of the shared memory used for the location depends on the number of
@@ -828,7 +778,7 @@ class Transceiver(Process, ABC):
     # region Abstract methods
 
     @abstractmethod
-    def _process_rx_value(self, symbol: float | int):
+    def _process_rx_amplitude(self, symbol: float | int):
         """Process a symbol received from the medium, e.g., buffer, decode. It is up to
         the subclasses to determing how what to do with the result, but it will eventually
         be stored in the :attr:`_rx_buffer` and made available to the next layer up.
@@ -915,9 +865,9 @@ class Transceiver(Process, ABC):
             if data is ManagementMessages.CLOSE:
                 break
 
-            # At this point we're expecting something of the form (tx/rx flag, value).
+            # At this point we're expecting something of the form (tx/rx flag, amplitude).
             try:
-                comms_type, value = data
+                comms_type, amplitude = data
             except TypeError:
                 log.error(
                     (
@@ -928,7 +878,7 @@ class Transceiver(Process, ABC):
                 continue
 
             if comms_type == CommsType.RECEIVE:
-                self._process_reception_event(conn, value)
+                self._process_reception_event(conn, amplitude)
             elif comms_type == CommsType.TRANSMIT:
                 self._process_transmission_event(conn)
             else:
@@ -943,17 +893,17 @@ class Transceiver(Process, ABC):
         # connection on our end.
         conn.close()
 
-    def _process_reception_event(self, conn: Connection, value: int | float):
+    def _process_reception_event(self, conn: Connection, amplitude: int | float):
         """
-        It's the responsibility of the subclass to determine what to do with the value
-        (e.g., how to manipulate/decode it, where to put it). Addtionally, the subclass
-        must give us the amount of nanoseconds to wait before sampling the :class:`Medium`
-        again.
+        It's the responsibility of the subclass to determine what to do with the observed
+        amplitude (e.g., how to manipulate/decode it, where to put it). Addtionally, the
+        subclass must give us the amount of nanoseconds to wait before sampling the
+        :class:`Medium` again.
         """
         try:
-            next_rx_delta = self._process_rx_value(value)
+            next_rx_delta = self._process_rx_amplitude(amplitude)
         except Exception as e:
-            log.error(f'{self}: Error processing {value=}: {e}')
+            log.error(f'{self}: Error processing {amplitude=}: {e}')
             # Regardless of the fact that there was an error, we should still be
             # configuring the next reception time, in this case defaulting to the
             # base delta.
@@ -965,28 +915,74 @@ class Transceiver(Process, ABC):
     def _process_transmission_event(self, conn: Connection):
         """
         The :class:`Medium` is telling us that we must now put a symbol on the
-        :class:`Medium`. It's the responsibility of the subclass to determine what to do
-        with the symbol (e.g., how to manipulate/encode it, where to get it from).
+        :class:`Medium`. It's the responsibility of the subclass to determine how to
+        create the symbol (e.g., how to manipulate/encode it, where to get it from). All
+        we do is make sure to send a representative function to the :class:`Medium`.
         """
         try:
             symbol = self._next_tx_symbol()
         except Exception as e:
             log.error(f'{self}: Error getting next symbol to transmit: {e}')
-            # The medium is waiting on us to send it a symbol, so we must send
-            # something. We'll send a 0 to indicate that we have nothing to send.
-            symbol = 0
 
-        # Send the symbol to the medium as well as the length of the symbol in
-        # nanoseconds and the amount of time to wait before sending the next
-        # symbol.
-        # TODO:
-        # For now we'll assume that the inter-symbol time and the length of the
-        # symbol are constant. A future improvement is to allow for phase shifts
-        # and clock drift(?).
+            # Tell the medium to move on without us.
+            conn.send(None)
+            return
+
+        if symbol is None:
+            # We don't have anything to transmit, so we'll tell the medium to move on
+            # without us.
+            conn.send(None)
+            return
+
+        # We could use EAFP to check if this is a function, but it's possible that an
+        # AttributeError will be raised by the function itself, which we should catch
+        # before passing this on the medium. So we'll use LBYL.
+        if callable(symbol):
+            # The output must be a float or integer.
+            try:
+                amplitude = symbol(0)
+            except Exception as e:
+                log.error(f'{self}: Error getting amplitude from symbol function: {e}')
+
+                # Tell the medium to move on without us.
+                conn.send(None)
+                return
+
+            if not isinstance(amplitude, (int, float)):
+                log.error(
+                    f'{self}: Symbol function returned an amplitude of type '
+                    f'{amplitude.__class__.__name__} ({amplitude!r}); expected int or '
+                    'float'
+                )
+
+                # Tell the medium to move on without us.
+                conn.send(None)
+                return
+        else:
+            # Okay, so it's not a function. We'll assume it's a float or integer.
+            if not isinstance(symbol, (int, float)):
+                log.error(
+                    f'{self}: Symbol is of type {symbol.__class__.__name__} '
+                    f'({symbol!r}); expected int, float or callable'
+                )
+
+                # Tell the medium to move on without us.
+                conn.send(None)
+                return
+
+            # The symbol is indeed a float or integer. We'll wrap it in a function so
+            # that we can use the same code path for both cases.
+            amplitude = symbol
+
+            def symbol(t):
+                return amplitude
+
+        # Send the symbol function to the medium as well as the length of the symbol in
+        # nanoseconds
         try:
-            conn.send(symbol, self._base_delta_ns, self._base_delta_ns)
+            conn.send(symbol, self._base_delta_ns)
         except Exception as e:
-            log.error(f'{self}: Error sending {symbol=} to medium: {e}')
+            log.error(f'{self}: Error sending symbol function to medium: {e}')
 
     # endregion
 
