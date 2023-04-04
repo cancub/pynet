@@ -7,6 +7,13 @@ how data is transmitted over the media.
 :author: Alf O'Kenney
 
 TODO:
+- add in-process init to allow users to initialize certain values that only really need to
+  be used within the process
+    - if they are created in __init__ then they must be Value or Array objects, which is
+      inconvenient
+    - additionally, users would need to remember to define these variabes prior to calling
+        super().__init__() in their own __init__ methods such that they would be available
+        after the fork
 - allow users to specify the clock frequency of the transceivers
 - allow users to specify a PLL for transceivers
 - implement subclass abstract base classes for electrical and optical media
@@ -23,7 +30,7 @@ import atexit
 import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from multiprocessing import Array, Event, Lock, Pipe, Process, Queue, Value
 from threading import Thread
 from time import monotonic_ns
@@ -60,22 +67,35 @@ class Transmission:
     objects."""
 
     def __init__(
-        self, symbol_fn: Callable, start_ns: float, duration_ns: float, attenuation: float
+        self,
+        symbol: int | float | Callable,
+        start_ns: float,
+        duration_ns: float,
+        attenuation: float,
     ):
         """
-        :param symbol_fn: A function that takes a single argument, the time since the
-            start of the transmission, and returns the amplitude of the symbol at that
-            time.
+        :param symbol: Either a static amplitude or a function that takes the time since
+            the start of the transmission as its input and returns the amplitude of the
+            signal at that time.
         :param start_ns: The global time (in nanoseconds) at which the transmission
             begins.
         :param duration_ns: The duration of the transmission in nanoseconds.
         :param attenuation: The attenuation of the transmission at the reference point
             associated with the reception of the transmission.
         """
-        self._symbol_fn = symbol_fn
+        self._symbol = symbol
         self._start_ns = start_ns
-        self._stop_ns = start_ns + duration_ns
+        self._stop_ns = start_ns + duration_ns * TIME_DILATION_FACTOR
         self._attenuation = attenuation
+
+    @cached_property
+    def _symbol_fn(self) -> Callable[[int | float], float]:
+        """A function that takes a single argument, the time since the start of the
+        transmission, and returns the amplitude of the symbol at that time.
+        """
+        if isinstance(self._symbol, (int, float)):
+            return lambda _: self._symbol
+        return self._symbol
 
     def get_amplitude(self, time_ns: float) -> float:
         """Read the amplitude of the symbol at a given time.
@@ -162,6 +182,19 @@ class CommsManager:
         TODO:
         Gracefully recover from an exception by using the previous delta time.
         """
+        self._send((CommsType.RECEIVE, self._get_amplitude()))
+
+        # The transceiver will respond with the delta time to the next rx event.
+        rx_delta_ns = self._recv()
+
+        # Update the next rx time.
+        # NOTE:
+        # We need to scale up the time to allow us to operate at a slower rate than the
+        # transceivers would be in real life. Don't worry, the Transmission object will
+        # scale back down again when it reads from the symbol function.
+        self.next_rx_ns += rx_delta_ns * TIME_DILATION_FACTOR
+
+    def _get_amplitude(self):
         # Collect the summation of the current amplitudes of all of the transmissions.
         amplitude = 0.0
 
@@ -180,21 +213,11 @@ class CommsManager:
                     f'{self}: an exception occurred while processing a transmission: {e}'
                 )
 
-        self._send((CommsType.RECEIVE, amplitude))
-
-        # The transceiver will respond with the delta time to the next rx event.
-        rx_delta_ns = self._recv()
-
-        # Update the next rx time.
-        # NOTE:
-        # We need to scale up the time to allow us to operate at a slower rate than the
-        # transceivers would be in real life. Don't worry, the Transmission object will
-        # scale back down again when it reads from the symbol function.
-        self.next_rx_ns += rx_delta_ns * TIME_DILATION_FACTOR
+        return amplitude
 
     def add_transmission(
         self,
-        symbol_fn: Callable,
+        symbol: Callable | int | float,
         start_ns: float,
         duration_ns: float,
         attenuation: float = 1.0,
@@ -202,16 +225,15 @@ class CommsManager:
         """Used by the :class:`Medium` to update the set of transmissions to be received
         by the :class:`Transceiver`.
 
-        :param symbol_fn: A function that takes a single argument the time since the start
-            of the transmission and returns the amplitude of the signal at that time.
+        :param symbol: Either a static amplitude or a function that takes the time since
+            the start of the transmission as its input and returns the amplitude of the
+            signal at that time.
         :param start_ns: The global time in nanoseconds at which the transmission begins.
         :param duration_ns: The duration of the transmission in nanoseconds.
         :param attenuation: The attenuation of the transmission once it reaches the
             :class:`Transceiver`.
         """
-        self._transmissions.add(
-            Transmission(symbol_fn, start_ns, duration_ns, attenuation)
-        )
+        self._transmissions.add(Transmission(symbol, start_ns, duration_ns, attenuation))
 
 
 class Medium(Process, ABC):
@@ -354,7 +376,7 @@ class Medium(Process, ABC):
 
     # region Optional overrides
 
-    def _disconnect(self):
+    def _disconnect(self, *args, **kwargs):
         """Run class-specific disconnection logic"""
         pass
 
@@ -420,19 +442,25 @@ class Medium(Process, ABC):
 
         new_cmgr = CommsManager(conn, monotonic_ns())
 
-        # Send the location back to the transceiver.
+        with self._comms_details_lock:
+            self._comms_details[location] = new_cmgr
+
+        # Send the location back to the transceiver to confirm that everything is okay.
         try:
             conn.send((Responses.OK, location))
         except Exception as e:
             log.error(f'{self}: connection info reply to transceiver failed: {e}')
 
-            # We cannot continue with this connection, since the transceiver is unaware of
-            # it.
+            # We need to remove the connection we just added.
+            # NOTE:
+            # The order might be odd, but it prevents race conditions where transceivers
+            # begin to transmit immediately after the connection is established and other
+            # transceivers are still being added in a loop
+            with self._comms_details_lock:
+                del self._comms_details[location]
             return
 
-        log.info(f'{self}: connection established at {location}')
-        with self._comms_details_lock:
-            self._comms_details[location] = new_cmgr
+        log.info(f'{self}: connection established at {location=}')
 
     def _remove_connection(self, conn_req: ConnRequest):
         """Remove a connection between a :class:`Transceiver` and this :class:`Medium`.
@@ -450,10 +478,10 @@ class Medium(Process, ABC):
                 f'{self}: subclass disconnection failed: {e}. Continuing with removal.'
             )
 
-        log.info(f'{self}: closing connection at {conn_req.location}')
+        log.info(f'{self}: closing connection at location={conn_req.location}')
         with self._comms_details_lock:
             # Make sure to not just remove the connection, but also to close it.
-            self._comms_details.pop(conn_req.location).conn.close()
+            self._comms_details.pop(conn_req.location)._conn.close()
 
     def _process_medium(self):
         """Process the transceivers for transmission events and medium sampling, storing
@@ -514,19 +542,21 @@ class Medium(Process, ABC):
             log.error(f'{self}: error while triggering tx: {e}')
             return
 
-        if symbol_info is None:
+        if symbol_info is None or symbol_info is ManagementMessages.CLOSE:
             # The transceiver has nothing to transmit.
             return
 
         # Oh, it's transmitting, alright.
-        symbol_fn, duration_ns = symbol_info
+        symbol, duration_ns = symbol_info
 
         log.debug(
             f'{self}: transceiver at location={loc} beginning transmission of new symbol'
         )
 
         # Keep track of the transmission so that we can check if it has finished.
-        self._transmission_completion_times[cmgr] = start_ns + duration_ns
+        self._transmission_completion_times[cmgr] = (
+            start_ns + duration_ns * TIME_DILATION_FACTOR
+        )
 
         # Add the symbol to the set of transmission functions of each of the other
         # transceivers.
@@ -538,7 +568,7 @@ class Medium(Process, ABC):
             # Allow for a calculation of signal attenuation based on distance.
             log.debug(f'{self}: adding transmission to set for location={dest_loc}')
             dest_cmgr.add_transmission(
-                symbol_fn,
+                symbol,
                 start_ns + self._calculate_travel_time_ns(loc, dest_loc),
                 duration_ns,
                 1,  # No attenuation for now.
@@ -619,9 +649,8 @@ class Transceiver(Process, ABC):
     # The medium types supported by a transceiver subclass.
     _supported_media: Sequence[Medium]
 
-    # The buffers to be used for inter-layer communication.
-    _tx_buffer: Array
-    _rx_buffer: Array
+    # The size of the buffers to be used for inter-layer communication.
+    _buffer_bytes: int
 
     # region Dunders
 
@@ -651,15 +680,7 @@ class Transceiver(Process, ABC):
             raise ValueError('`buffer_bytes` must be a positive integer.')
 
         cls._supported_media = supported_media
-
-        # In the absence of a bit array type, we'll use a byte array and do the
-        # necessary bit-level operations ourselves. It is the responsibility of the
-        # next layer up to write bytes to the buffer and read bytes from the buffer.
-        # NOTE:
-        # Because data can be sent at both positie and negative energy levels, we need
-        # to use signed bytes.
-        cls._tx_buffer = Array('b', [0] * buffer_bytes)
-        cls._rx_buffer = Array('b', [0] * buffer_bytes)
+        cls._buffer_bytes = buffer_bytes
 
     def __new__(cls, name: str, *args, **kwargs):
         try:
@@ -721,6 +742,21 @@ class Transceiver(Process, ABC):
         self.osi_listener: Connection = osi_listener
         self._osi_client: Connection = osi_client
 
+        # The buffers to be used for inter-layer communication.
+        # NOTE:
+        # - These are not used within this parent class. The intention is for them to be
+        #   used as a workspace for child classes for communicating between layers. For
+        #   example, buffering two symbols of a Manchester encoded bit from the medium and
+        #   placing this decoded bit in the rx buffer before signaling to the MAC layer
+        #   that the full frame has been received.
+        # - In the absence of a bit array type, we'll use a byte array and do the
+        #   necessary bit-level operations ourselves. It is the responsibility of the next
+        #   layer up to write bytes to the buffer and read bytes from the buffer.
+        # - Because data can be sent at both positive and negative energy levels, we need
+        #   to use signed bytes.
+        self._tx_buffer: Array = Array('b', [0] * self._buffer_bytes)
+        self._rx_buffer: Array = Array('b', [0] * self._buffer_bytes)
+
         # By default, we do the caller the service of starting up the Process rather than
         # making them remember to do it for each and every Transceiver instance.
         if auto_start:
@@ -778,22 +814,26 @@ class Transceiver(Process, ABC):
     # region Abstract methods
 
     @abstractmethod
-    def _process_rx_amplitude(self, symbol: float | int):
-        """Process a symbol received from the medium, e.g., buffer, decode. It is up to
-        the subclasses to determing how what to do with the result, but it will eventually
-        be stored in the :attr:`_rx_buffer` and made available to the next layer up.
+    def _process_rx_amplitude(self, amplitude: float | int):
+        """Process the amplitude value received from the medium. It is up to the
+        subclasses to determine what to do with the result (e.g., buffer, decode), and it
+        will eventually be stored in the :attr:`_rx_buffer` and made available to the next
+        layer up.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def _next_tx_symbol(self) -> float | int:
-        """Provide us with the next symbol to be put on the medium, e.g., encoding. It is
-        up to the subclasses to determine how to do this, but the result will be sent to
-        the medium via the :attr:`_tx_queue`. For example, a :class:`Transceiver` which
-        uses Manchester encoding might take the next bit from the :attr:`_tx_buffer` and
-        convert it into the two symbols needed to represent it. It would then buffer the
-        second symbol and return the first. On the next call, it would return the second
-        symbol and buffer the second bit.
+    def _next_tx_symbol(self) -> float | int | None:
+        """Provide us with the next symbol to be put on the medium. It is up to the
+        subclasses to determine how to do this (e.g., encoding), and the result will be
+        sent to the medium via the :attr:`_tx_queue`. For example, a :class:`Transceiver`
+        which uses Manchester encoding might take the next bit from the :attr:`_tx_buffer`
+        and convert it into the two symbols needed to represent it. It would then buffer
+        the second symbol and return the first. On the next call, it would return the
+        second symbol and buffer the next bit in the data.
+
+        If the :attr:`_tx_buffer` is empty, this method should return `None` to indicate
+        that there is no more data to send, since a 0 could be a valid symbol.
         """
         raise NotImplementedError
 
@@ -844,7 +884,7 @@ class Transceiver(Process, ABC):
                 current_conn.send(ManagementMessages.CLOSE)
                 thread.join()
 
-                current_conn.conn.close()
+                current_conn.close()
                 current_conn = None
                 self._medium = None
 
@@ -909,6 +949,11 @@ class Transceiver(Process, ABC):
             # base delta.
             next_rx_delta = self._base_delta_ns
 
+        if next_rx_delta is None:
+            # If the subclass didn't give us a next reception time, we'll just default to
+            # the base delta.
+            next_rx_delta = self._base_delta_ns
+
         # Reply with the next reception time.
         conn.send(next_rx_delta)
 
@@ -970,17 +1015,10 @@ class Transceiver(Process, ABC):
                 conn.send(None)
                 return
 
-            # The symbol is indeed a float or integer. We'll wrap it in a function so
-            # that we can use the same code path for both cases.
-            amplitude = symbol
-
-            def symbol(t):
-                return amplitude
-
         # Send the symbol function to the medium as well as the length of the symbol in
         # nanoseconds
         try:
-            conn.send(symbol, self._base_delta_ns)
+            conn.send((symbol, self._base_delta_ns))
         except Exception as e:
             log.error(f'{self}: Error sending symbol function to medium: {e}')
 

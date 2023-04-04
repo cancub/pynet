@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from math import sin
+from multiprocessing import Value
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event, Lock
 from unittest import TestCase, main
@@ -9,7 +10,6 @@ from unittest.mock import Mock, call, patch
 
 from pynet.physical.base import (
     CommsManager,
-    ConnRequest,
     Medium,
     Transceiver,
     Transmission,
@@ -47,11 +47,11 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=15
     """A helper class for testing the :class:`Transceiver` class. Defines the necessary
     abstract methods to instantiate the class."""
 
-    def _process_rx_amplitude(self, data, *args, **kwargs):
-        return data
+    def _process_rx_amplitude(self, amplitude, *args, **kwargs):
+        return amplitude
 
-    def _next_tx_symbol(self, data, *args, **kwargs):
-        return data
+    def _next_tx_symbol(self, *args, **kwargs):
+        return 0
 
 
 # endregion
@@ -60,7 +60,7 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=15
 
 
 class TestTransmission(TestCase):
-    def test_read(self):
+    def test_get_amplitude(self):
         start_ns = 100
         duration_ns = 200
         attenuation = 0.5
@@ -81,7 +81,7 @@ class TestTransmission(TestCase):
 
         with self.subTest('stop'):
             with self.assertRaises(TransmissionComplete):
-                tx.get_amplitude(start_ns + duration_ns)
+                tx.get_amplitude(start_ns + duration_ns * TIME_DILATION_FACTOR)
 
 
 class TestCommsManager(TestCase, LogTestingMixin):
@@ -366,195 +366,188 @@ class TestMedium(TestPHYBase):
         mock_thread.start.assert_called_once()
         mock_thread.join.assert_called_once()
 
-    # region _monitor_connections
+    # region _monitor_connections-related
 
     @patch(f'{BASE_TARGET}.Event', autospec=True)
     @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_disconnect')
-    @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_add_connection_subclass_connect_error(
-        self, connect_mock, disconnect_mock, *mocks
-    ):
+    @patch.object(MockMedium, '_remove_connection')
+    @patch.object(MockMedium, '_add_connection')
+    def test_monitor_connections(self, add_mock, remove_mock, *mocks):
         medium = self.build_medium()
-        mock_conn = Mock()
-        kwargs = {'foo': 'bar'}
 
-        # Allow for one loop to perform a connection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
+        conn_queue_get = medium._connection_queue.get
+        stop_is_set = medium._stop_event.is_set
 
-        # Set up the new connection.
-        medium._connection_queue.get.return_value = creq = ConnRequest(
-            mock_conn, None, True, kwargs
-        )
+        def reset_mocks():
+            conn_queue_get.reset_mock()
+            conn_queue_get.side_effect = None
+            stop_is_set.reset_mock()
+            add_mock.reset_mock()
+            remove_mock.reset_mock()
 
-        # Make the connection fail.
-        err_str = 'Boom!'
-        connect_mock.side_effect = err = Exception(err_str)
+        with self.subTest('close message'):
+            stop_is_set.side_effect = [False]
+            conn_queue_get.return_value = ManagementMessages.CLOSE
 
-        # Use this test to check the debug logs as well.
-        with self.assertInTargetLogs('ERROR', f'{medium}: connection failed: {err_str}'):
             medium._monitor_connections()
 
-        # Confirm that there was one connection and no disconnection.
-        connect_mock.assert_called_once_with(creq)
-        mock_conn.send.assert_called_once_with((Responses.ERROR, err))
-        disconnect_mock.assert_not_called()
+            conn_queue_get.assert_called_once()
+            stop_is_set.assert_called_once()
+            add_mock.assert_not_called()
+            remove_mock.assert_not_called()
 
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_disconnect')
-    @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_add_connection_reply_fails(
-        self, connect_mock, disconnect_mock, *mocks
-    ):
-        medium = self.build_medium()
-        mock_conn = Mock()
-        kwargs = {'foo': 'bar'}
+        reset_mocks()
 
-        # Allow for one loop to perform a connection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
+        with self.subTest('bad connection request'):
+            stop_is_set.side_effect = [False, True]
+            conn_queue_get.return_value = 'bad request'
 
-        # Set up the new connection.
-        medium._connection_queue.get.return_value = creq = ConnRequest(
-            mock_conn, None, True, kwargs
-        )
-        location = connect_mock.return_value
+            with self.assertInTargetLogs(
+                'ERROR', f'{medium}: unexpected connection details type: str'
+            ):
+                medium._monitor_connections()
 
-        # Make the reply fail.
-        mock_conn.send.side_effect = Exception(err_str := 'Boom!')
+            conn_queue_get.assert_called_once()
+            self.assertEqual(stop_is_set.call_count, 2)
+            add_mock.assert_not_called()
+            remove_mock.assert_not_called()
 
-        # Use this test to check the debug logs as well.
-        with self.assertInTargetLogs(
-            'ERROR', f'{medium}: connection info reply to transceiver failed: {err_str}'
-        ):
+        reset_mocks()
+
+        with self.subTest('add connection'):
+            stop_is_set.side_effect = [False, True]
+            conn_queue_get.return_value = creq = Mock(create=True)
+
             medium._monitor_connections()
 
-        # Confirm that there was one connection and no disconnection.
-        connect_mock.assert_called_once_with(creq)
-        mock_conn.send.assert_called_once_with((Responses.OK, location))
-        disconnect_mock.assert_not_called()
+            conn_queue_get.assert_called_once()
+            self.assertEqual(stop_is_set.call_count, 2)
+            add_mock.assert_called_once_with(creq)
+            remove_mock.assert_not_called()
 
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
+        reset_mocks()
+
+        with self.subTest('remove connection'):
+            stop_is_set.side_effect = [False, True]
+            conn_queue_get.return_value = creq = Mock(create=False)
+
+            medium._monitor_connections()
+
+            conn_queue_get.assert_called_once()
+            self.assertEqual(stop_is_set.call_count, 2)
+            add_mock.assert_not_called()
+            remove_mock.assert_called_once_with(creq)
+
     @patch(f'{BASE_TARGET}.CommsManager', autospec=True)
     @patch(f'{BASE_TARGET}.monotonic_ns', autospec=True)
-    @patch.object(MockMedium, '_disconnect')
     @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_add_connection_success(
-        self, connect_mock, disconnect_mock, mono_mock, CommsManagerMock, *mocks
-    ):
+    def test_add_connection(self, connect_mock, mono_mock, CommsManagerMock):
         medium = self.build_medium()
         mock_conn = Mock()
-        kwargs = {'foo': 'bar'}
-
-        # Allow for one loop to perform a connection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
-
-        # Set up the new connection.
-        medium._connection_queue.get.return_value = creq = ConnRequest(
-            mock_conn, None, True, kwargs
-        )
-        location = connect_mock.return_value
-        cmgr = CommsManagerMock.return_value
-
-        # Use this test to check the debug logs as well.
-        with self.assertInTargetLogs(
-            'DEBUG',
-            ['Starting connection worker thread', 'Connection worker thread exiting'],
-        ):
-            medium._monitor_connections()
-
-        # Confirm that there was one connection and no disconnection.
-        connect_mock.assert_called_once_with(creq)
-        CommsManagerMock.assert_called_once_with(mock_conn, mono_mock.return_value)
-        mock_conn.send.assert_called_once_with((Responses.OK, location))
-        self.assertEqual(medium._comms_details[location], cmgr)
-
-        disconnect_mock.assert_not_called()
-
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    @patch.object(MockMedium, '_disconnect')
-    @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_remove_connection_subclass_disconnect_error(
-        self, connect_mock, disconnect_mock, *mocks
-    ):
-        medium = self.build_medium()
+        conn_req = Mock(conn=mock_conn)
+        conn_send = mock_conn.send
         location = 123
 
-        # Allow for one loop to perform a disconnection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
+        def reset_mocks():
+            connect_mock.reset_mock()
+            mono_mock.reset_mock()
+            CommsManagerMock.reset_mock()
+            mock_conn.reset_mock()
+            conn_send.reset_mock()
 
-        # Set up the existing connection.
-        medium._connection_queue.get.return_value = creq = ConnRequest(
-            None, location, False, None
-        )
-        medium._comms_details[location] = cmgr = Mock()
+            connect_mock.side_effect = None
+            conn_send.side_effect = None
 
-        # Make the disconnection fail.
-        err_str = 'Boom!'
-        disconnect_mock.side_effect = Exception(err_str)
+        with self.subTest('connect exception'):
+            connect_mock.side_effect = err = Exception(err_str := 'connect exception')
 
-        with self.assertInTargetLogs(
-            'ERROR',
-            (
-                f'{medium}: subclass disconnection failed: {err_str}. Continuing with '
-                'removal.'
-            ),
-        ):
-            medium._monitor_connections()
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{medium}: connection failed: {err_str}',
+            ):
+                medium._add_connection(conn_req)
 
-        # Confirm that there was one disconnection and no connection.
-        disconnect_mock.assert_called_once_with(creq)
-        cmgr.conn.close.assert_called_once()
-        self.assertEqual(medium._comms_details, {})
+            connect_mock.assert_called_once_with(conn_req)
+            conn_send.assert_called_once_with((Responses.ERROR, err))
+            CommsManagerMock.assert_not_called()
 
-        connect_mock.assert_not_called()
+        reset_mocks()
 
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
+        with self.subTest('reply error'):
+            connect_mock.return_value = location
+            conn_send.side_effect = Exception(err_str := 'send exception')
+
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{medium}: connection info reply to transceiver failed: {err_str}',
+            ):
+                medium._add_connection(conn_req)
+
+            connect_mock.assert_called_once_with(conn_req)
+            conn_send.assert_called_once_with((Responses.OK, location))
+            CommsManagerMock.assert_called_once_with(mock_conn, mono_mock.return_value)
+            self.assertNotIn(location, medium._comms_details)
+
+        reset_mocks()
+
+        with self.subTest('success'):
+            connect_mock.return_value = location
+
+            with self.assertInTargetLogs(
+                'INFO',
+                f'{medium}: connection established at {location=}',
+            ):
+                medium._add_connection(conn_req)
+
+            connect_mock.assert_called_once_with(conn_req)
+            conn_send.assert_called_once_with((Responses.OK, location))
+            CommsManagerMock.assert_called_once_with(mock_conn, mono_mock.return_value)
+            self.assertEqual(
+                medium._comms_details[location], CommsManagerMock.return_value
+            )
+
     @patch.object(MockMedium, '_disconnect')
-    @patch.object(MockMedium, '_connect')
-    def test_monitor_connections_remove_connection_success(
-        self, connect_mock, disconnect_mock, *mocks
-    ):
+    def test_remove_connection(self, disconnect_mock, *mocks):
         medium = self.build_medium()
+
         location = 123
+        conn = Mock()
+        creq = Mock(location=location)
+        cmgr = Mock(_conn=conn)
 
-        # Allow for one loop to perform a disconnection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
+        def reset_mocks():
+            disconnect_mock.reset_mock()
+            disconnect_mock.side_effect = None
+            conn.reset_mock()
 
-        # Set up the existing connection.
-        medium._connection_queue.get.return_value = creq = ConnRequest(
-            None, location, False, None
-        )
-        medium._comms_details[location] = cmgr = Mock()
+        with self.subTest('disconnect error'):
+            medium._comms_details = {location: cmgr}
+            disconnect_mock.side_effect = Exception(err_str := 'disconnect exception')
 
-        medium._monitor_connections()
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{medium}: subclass disconnection failed: {err_str}. Continuing with removal.',
+            ):
+                medium._remove_connection(creq)
 
-        # Confirm that there was one disconnection and no connection.
-        disconnect_mock.assert_called_once_with(creq)
-        cmgr.conn.close.assert_called_once()
-        self.assertEqual(medium._comms_details, {})
+            disconnect_mock.assert_called_once_with(creq)
+            conn.close.assert_called_once()
+            self.assertNotIn(location, medium._comms_details)
 
-        connect_mock.assert_not_called()
+        reset_mocks()
 
-    @patch(f'{BASE_TARGET}.Event', autospec=True)
-    @patch(f'{BASE_TARGET}.Queue', autospec=True)
-    def test_monitor_connections_got_bad_connection_request(self, *mocks):
-        medium = self.build_medium()
-        medium._stop_event.is_set.return_value = True
+        with self.subTest('success'):
+            medium._comms_details = {location: cmgr}
 
-        # Allow for one loop to perform a connection and then exit.
-        medium._stop_event.is_set.side_effect = [False, True]
+            with self.assertInTargetLogs(
+                'INFO',
+                f'{medium}: closing connection at {location=}',
+            ):
+                medium._remove_connection(creq)
 
-        medium._connection_queue.get.return_value = 123
-
-        with self.assertInTargetLogs(
-            'ERROR',
-            f'{medium}: unexpected connection details type: int',
-        ):
-            medium._monitor_connections()
+            disconnect_mock.assert_called_once_with(creq)
+            conn.close.assert_called_once()
+            self.assertNotIn(location, medium._comms_details)
 
     # endregion
 
@@ -655,7 +648,7 @@ class TestMedium(TestPHYBase):
 
             self.assertEqual(
                 medium._transmission_completion_times,
-                {src_cmgr: current_ns + duration_ns},
+                {src_cmgr: current_ns + duration_ns * TIME_DILATION_FACTOR},
             )
 
             calc_travel_time_mock.assert_called_once_with(src_loc, dest_loc)
@@ -682,7 +675,8 @@ class TestMedium(TestPHYBase):
             src_trigger_tx.assert_called_once()
 
             self.assertEqual(
-                medium._transmission_completion_times, {src_cmgr: stop_ns + duration_ns}
+                medium._transmission_completion_times,
+                {src_cmgr: stop_ns + duration_ns * TIME_DILATION_FACTOR},
             )
 
             calc_travel_time_mock.assert_called_once_with(src_loc, dest_loc)
@@ -712,6 +706,7 @@ class TestMedium(TestPHYBase):
         reset_mocks()
 
         with self.subTest('tx triggered with error'):
+            medium._transmission_completion_times = {}
             current_ns = stop_ns + duration_ns + 1
 
             # Ignore receptions.
@@ -764,7 +759,7 @@ class TestMedium(TestPHYBase):
 
         travel_time_ns = medium._calculate_travel_time_ns(src_loc, dest_loc)
         start_ns = current_time + travel_time_ns
-        stop_ns = start_ns + duration_ns
+        stop_ns = start_ns + duration_ns * TIME_DILATION_FACTOR
 
         # Configure the connection managers such that all rx events are upcoming.
         src_cmgr = CommsManager(src_conn, init_ns)
@@ -1005,8 +1000,7 @@ class TestTransceiver(TestPHYBase):
                 pass
 
             self.assertEqual(GoodTransceiver._supported_media, test_media)
-            self.assertEqual(list(GoodTransceiver._tx_buffer), [0] * buffer_bytes)
-            self.assertEqual(list(GoodTransceiver._rx_buffer), [0] * buffer_bytes)
+            self.assertEqual(GoodTransceiver._buffer_bytes, buffer_bytes)
 
     def test__new__(self):
         x1 = self.build_xcvr()
@@ -1051,6 +1045,9 @@ class TestTransceiver(TestPHYBase):
                 self.assertEqual(xcvr._connections_client, mod_client)
                 self.assertEqual(xcvr.osi_listener, osi_listener)
                 self.assertEqual(xcvr._osi_client, osi_client)
+
+                self.assertEqual(list(xcvr._tx_buffer), [0] * xcvr._buffer_bytes)
+                self.assertEqual(list(xcvr._rx_buffer), [0] * xcvr._buffer_bytes)
 
                 self.assertIsInstance(xcvr._stop_event, Event)
 
@@ -1512,7 +1509,7 @@ class TestTransceiver(TestPHYBase):
 
             next_mock.assert_called_once()
             symbol_fn.assert_called_once_with(0)
-            send.assert_called_once_with(symbol_fn, base_delta_ns)
+            send.assert_called_once_with((symbol_fn, base_delta_ns))
 
         next_mock.reset_mock()
         send.reset_mock()
@@ -1541,10 +1538,7 @@ class TestTransceiver(TestPHYBase):
             next_mock.assert_called_once()
             send.assert_called_once()
 
-            fn, delta = send.call_args[0]
-
-            self.assertEqual(delta, base_delta_ns)
-            self.assertEqual(fn(0), symbol)
+            send.assert_called_once_with((symbol, base_delta_ns))
 
         next_mock.reset_mock()
         send.reset_mock()
@@ -1559,7 +1553,7 @@ class TestTransceiver(TestPHYBase):
                 xcvr._process_transmission_event(conn)
 
             next_mock.assert_called_once()
-            send.assert_called_once_with(symbol_fn, base_delta_ns)
+            send.assert_called_once_with((symbol_fn, base_delta_ns))
 
     @patch(f'{BASE_TARGET}.Event', autospec=True)
     @patch.object(MockTransceiver, '_process_reception_event')
@@ -1713,35 +1707,147 @@ class TestTransceiver(TestPHYBase):
     # endregion
 
 
+# A couple of symbols that allow our rudimentary transceiver to know when it has
+# reached the start and end of a transmission.
+START_SYMBOL = 126
+END_SYMBOL = 127
+
+READ_MSG = 'READ!'
+
+
+class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16):
+    """A very rudinmentary transceiver that can be used for producing and consuming a
+    single item from the tx and rx buffers.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.rx_ongoing = Value('b', 0)
+        self.tx_ongoing = Value('b', 0)
+
+        self.rx_index = Value('b', 0)
+        self.tx_index = Value('b', 0)
+
+        super().__init__(*args, **kwargs)
+
+    def _process_rx_amplitude(self, amplitude, *args, **kwargs):
+        if not self.rx_ongoing.value:
+            if amplitude != START_SYMBOL:
+                # Nothing to receive yet.
+                return
+
+            # Our buffer now contains data to receive.
+            self.rx_ongoing.value = 1
+
+        # Place the received amplitude in the buffer
+        with self._rx_buffer.get_lock():
+            print(
+                f'{self} storing rx amplitude', amplitude, 'at index', self.rx_index.value
+            )
+            self._rx_buffer[self.rx_index.value] = int(amplitude)
+
+        self.rx_index.value += 1
+
+        if amplitude == END_SYMBOL:
+            # We've reached the end of the reception.
+            self.rx_ongoing.value = 0
+
+            # Alert the higher layer that it may now observe the buffer.
+            print(f'{self} sending READ_MSG')
+            self._osi_client.send(READ_MSG)
+
+    def _next_tx_symbol(self, *args, **kwargs):
+        with self._tx_buffer.get_lock():
+            symbol = self._tx_buffer[self.tx_index.value]
+
+        if not self.tx_ongoing.value:
+            if symbol != START_SYMBOL:
+                # Nothing to transmit yet.
+                return None
+
+            # Our buffer now contains data to transmit.
+            self.tx_ongoing.value = 1
+
+        print(f'{self} got tx symbol', symbol)
+
+        if symbol == END_SYMBOL:
+            # We've reached the end of the transmission.
+            self.tx_ongoing.value = 0
+
+        self.tx_index.value += 1
+
+        return symbol
+
+
 class TestIPC(TestPHYBase):
     def test_send_data_between_transceivers(self):
         # Make sure a broadcast is received by all transceivers.
         names = {'alice', 'bob', 'carla', 'dave', 'eve', 'frank'}
         base_baud = 1e6
-        xvcrs = {n: MockTransceiver(name=n.title(), base_baud=base_baud) for n in names}
+        xvcrs = {n: IPCTransceiver(name=n.title(), base_baud=base_baud) for n in names}
+
+        tx_data_len = 10
+        last_index = tx_data_len + 1
 
         medium = MockMedium(name='air')
 
         for xcvr in xvcrs.values():
             xcvr.connect(medium)
 
-        for sender_name in names:
+        # Every sender has their message heard by every receiver and does not hear their
+        # own message.
+        for i, sender_name in enumerate(names):
+            print(f'\n\n\n\n\nChecking {sender_name} test')
             receiver_names = names - {sender_name}
 
             sender = xvcrs[sender_name]
-            sender.transmit(tx_data := sender_name[0])
+
+            # Place a sequence of values in the sender's transmit buffer, with the start
+            # value being the index of the sender in the list of names.
+            tx_data = list(range(i, i + tx_data_len))
+
+            with sender._tx_buffer.get_lock():
+                sender._tx_buffer[0] = START_SYMBOL
+                for j in range(tx_data_len):
+                    sender._tx_buffer[j + 1] = tx_data[j]
+                sender._tx_buffer[j + 2] = END_SYMBOL
 
             with self.subTest(sender=sender_name, receivers=receiver_names):
                 # Each of the receivers should have received the data.
                 for name in receiver_names:
                     receiver = xvcrs[name]
 
-                    if not receiver.osi_listener.poll(timeout=0.1):
+                    if not receiver.osi_listener.poll(timeout=5):
                         self.fail(f'No data in {sender_name} to {name} test')
-                    self.assertEqual(receiver.osi_listener.recv(), tx_data)
+
+                    # Make sure that we got the read message.
+                    self.assertEqual(receiver.osi_listener.recv(), READ_MSG)
+
+                    # Observe and consume the data.
+                    with receiver._rx_buffer.get_lock():
+                        rx_data = receiver._rx_buffer[1:last_index]
+
+                        print(receiver, rx_data)
+                        self.assertEqual(rx_data, tx_data)
+
+                        # Make sure the buffer is empty before moving on to the next test.
+                        for j in range(tx_data_len + 2):
+                            receiver._rx_buffer[j] = 0
+
+                        receiver.rx_index.value = 0
 
                 # The sender should not have received the data.
                 self.assertFalse(sender.osi_listener.poll(timeout=0.1))
+
+            # Clear the sender's transmit buffer.
+            with sender._tx_buffer.get_lock():
+                for j in range(tx_data_len + 2):
+                    sender._tx_buffer[j] = 0
+
+                sender.tx_index.value = 0
+
+        # Make sure that the transceivers are stopped.
+        for xcvr in xvcrs.values():
+            xcvr.stop()
 
 
 # endregion
