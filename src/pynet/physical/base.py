@@ -162,6 +162,22 @@ class CommsManager:
                 f'Could not receive data from the Transceiver via {self}: {e}'
             )
 
+    def _is_medium_idle(self, current_time: float) -> bool:
+        """Check if the :class:`Medium` is idle.
+
+        :param current_time: The current time in nanoseconds, as measured by the
+            :class:`Medium`.
+
+        :returns: ``True`` if the :class:`Medium` is idle, ``False`` otherwise.
+        """
+        if not self._transmissions:
+            return True
+
+        # The next transmission is the one that starts the soonest.
+        earliest_tx = min(self._transmissions, key=lambda t: t._start_ns)
+
+        return earliest_tx._start_ns > current_time
+
     def trigger_tx(self) -> tuple[Callable | None, float]:
         """Ping the :class:`Transceiver` to transmit a symbol and wait for a response
         containing the function describing the symbol to be transmitted and the duration
@@ -175,24 +191,52 @@ class CommsManager:
 
         return self._recv()
 
-    def trigger_rx(self):
+    def maybe_trigger_rx(self, current_time_ns: float) -> None:
         """Send the summation of the various symbol amplitudes at this time to the
         :class:`Transceiver`.
+
+        :param current_time_ns: The time in nanoseconds from the pespective of the
+            :class:`Medium`.
 
         TODO:
         Gracefully recover from an exception by using the previous delta time.
         """
-        self._send((CommsType.RECEIVE, self._get_amplitude()))
+        if self.next_rx_ns == -1:
+            # The receiver is waiting for the medium to no longer be idle. Check if that
+            # is the case.
+            if self._is_medium_idle(current_time_ns) > 0:
+                # The medium is idle, so we don't have to do anything.
+                return
+
+        # Either the medium is not idle or the receiver is in sampling mode.
+        amplitude = self._get_amplitude()
+
+        self._send((CommsType.RECEIVE, amplitude))
 
         # The transceiver will respond with the delta time to the next rx event.
         rx_delta_ns = self._recv()
 
-        # Update the next rx time.
-        # NOTE:
-        # We need to scale up the time to allow us to operate at a slower rate than the
-        # transceivers would be in real life. Don't worry, the Transmission object will
-        # scale back down again when it reads from the symbol function.
-        self.next_rx_ns += rx_delta_ns * TIME_DILATION_FACTOR
+        if rx_delta_ns == -1:
+            # The transceiver wishes to only be contacted when the medium is no longer
+            # idle.
+            # NOTE:
+            # We set to -1 so that the medium will always attempt to trigger a reception.
+            self.next_rx_ns = -1
+        else:
+            # The transceiver wants to keep sampling, so update the next rx time.
+            if self.next_rx_ns == -1:
+                # The medium was previously idle, so there was no previous sample time and
+                # we need to instead offset from the current time.
+                this_rx_ns = current_time_ns
+            else:
+                # We're continuing from a previous sample time.
+                this_rx_ns = self.next_rx_ns
+
+            # NOTE:
+            # We need to scale up the time to allow us to operate at a slower rate than
+            # the transceivers would be in real life. Don't worry, the Transmission object
+            # will scale back down again when it reads from the symbol function.
+            self.next_rx_ns = this_rx_ns + rx_delta_ns * TIME_DILATION_FACTOR
 
     def _get_amplitude(self):
         # Collect the summation of the current amplitudes of all of the transmissions.
@@ -509,7 +553,10 @@ class Medium(Process, ABC):
         if cmgr.next_rx_ns <= current_ns:
             log.debug(f'{self}: triggering rx at location={loc}')
             try:
-                cmgr.trigger_rx()
+                # Let the CommsManager know the current time in case the Transceiver was
+                # not sampling and was instead waiting to sense a transmission on the
+                # medium.
+                cmgr.maybe_trigger_rx(current_ns)
             except ConnectionError as e:
                 log.error(f'{self}: error while triggering rx: {e}')
 
@@ -938,7 +985,12 @@ class Transceiver(Process, ABC):
         It's the responsibility of the subclass to determine what to do with the observed
         amplitude (e.g., how to manipulate/decode it, where to put it). Addtionally, the
         subclass must give us the amount of nanoseconds to wait before sampling the
-        :class:`Medium` again.
+        :class:`Medium` again, with a value of -1 indicating that we should only be
+        informed of the next reception event (simulating the monitoring of the "active"
+        bit).
+
+        :param conn: The connection to the medium.
+        :param amplitude: The amplitude value received from the medium.
         """
         try:
             next_rx_delta = self._process_rx_amplitude(amplitude)
@@ -951,8 +1003,9 @@ class Transceiver(Process, ABC):
 
         if next_rx_delta is None:
             # If the subclass didn't give us a next reception time, we'll just default to
-            # the base delta.
-            next_rx_delta = self._base_delta_ns
+            # half of the base delta, in keeping with the Nyquist-Shannon sampling
+            # theorem.
+            next_rx_delta = self._base_delta_ns / 2
 
         # Reply with the next reception time.
         conn.send(next_rx_delta)
