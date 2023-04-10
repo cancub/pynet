@@ -18,7 +18,11 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 # configurations on the performance of networks. Thus, the time dilation factor is a way
 # to put the network in a sort of slow motion in order to accurately reproduce these
 # effects.
-TIME_DILATION_FACTOR = 1_000
+# NOTE:
+# This is a bit of a heuristic. It's not clear what the best value for this is, and it may
+# be that your system can function fine with a smaller value. Run TestIPC in the tests
+# several times to see if your chosen value makes sense.
+TIME_DILATION_FACTOR = 10_000
 
 # It's not elegant, but it likely gives users enough space to describe what they want.
 DEFAULT_NAME = b' ' * 64
