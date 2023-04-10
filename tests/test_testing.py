@@ -78,7 +78,7 @@ class TestLogTestingMixin(TestCase):
             )
 
     def test_assert_not_in_logs_with_regex(self):
-        for log_str in [None, 'test']:
+        for log_str in [None, 'test123']:
             self._run_logging_test(
                 regex=True,
                 msgs_args=['f.o', [r't\w{3}t', r't\dst']],
@@ -88,15 +88,15 @@ class TestLogTestingMixin(TestCase):
 
     def test_assert_in_logs_but_nothing_logged(self):
         with self.assertRaises(AssertionError):
-            with self.mixin_tester.assertInLogs(__name__, logging.DEBUG, 'test'):
+            with self.mixin_tester.assertInLogs(__name__, logging.DEBUG, 'test123'):
                 pass
 
     def test_assertInTargetLogs(self):
-        with self.mixin_tester.assertInTargetLogs(logging.DEBUG, 'test'):
-            log.debug('test')
+        with self.mixin_tester.assertInTargetLogs(logging.DEBUG, 'test123'):
+            log.debug('test123')
 
     def test_assertNotInTargetLogs(self):
-        with self.mixin_tester.assertNotInTargetLogs(logging.DEBUG, 'test'):
+        with self.mixin_tester.assertNotInTargetLogs(logging.DEBUG, 'test123'):
             log.debug('foo')
 
 
@@ -196,17 +196,27 @@ class TestProcessBuilderMixin(TestCase):
             (None, True, False),
             # auto_start
             (True, False),
+            # location
+            (None, 0, 1),
         )
 
-        for name, mocked, is_alive, auto_start in test_specs:
+        for name, mocked, is_alive, auto_start, location in test_specs:
             auto_gen_name = f'test_{len(Transceiver._instances)}'
 
             xcvr = self.xcvr_tester.build_xcvr(
-                name=name, mocked=mocked, is_alive=is_alive, auto_start=auto_start
+                name=name,
+                mocked=mocked,
+                is_alive=is_alive,
+                auto_start=auto_start,
+                location=location,
             )
 
             with self.subTest(
-                name=name, mocked=mocked, is_alive=is_alive, auto_start=auto_start
+                name=name,
+                mocked=mocked,
+                is_alive=is_alive,
+                auto_start=auto_start,
+                location=location,
             ):
                 self.assertIsInstance(xcvr, Transceiver)
 
@@ -226,6 +236,9 @@ class TestProcessBuilderMixin(TestCase):
 
                 if is_alive is not None:
                     self.assertEqual(is_alive, xcvr.is_alive())
+
+                if location is not None:
+                    self.assertEqual(location, xcvr.location)
 
             start_mock.reset_mock()
 

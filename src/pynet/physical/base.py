@@ -31,10 +31,11 @@ import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from functools import cached_property, lru_cache
-from multiprocessing import Array, Event, Lock, Pipe, Process, Queue, Value
+from multiprocessing import Array, Event, Lock, Pipe, Process, Queue
+from multiprocessing.connection import Connection
 from threading import Thread
 from time import monotonic_ns
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import Any, Callable, Sequence
 from weakref import WeakValueDictionary
 
 from .constants import (
@@ -47,12 +48,8 @@ from .constants import (
     Responses,
 )
 from .exceptions import ConnectionError, ProcessNotRunningError, TransmissionComplete
-from ..space import euclidean_distance
+from ..space import Location, euclidean_distance
 
-if TYPE_CHECKING:
-    from multiprocessing.connection import Connection
-
-    from ..space import Location
 
 __all__ = ['Medium', 'Transceiver']
 
@@ -726,7 +723,7 @@ class Transceiver(Process, ABC):
 
         bad_media = [m for m in supported_media if not issubclass(m, Medium)]
         if bad_media:
-            raise TypeError(f'{bad_media} are not subclasses of {Medium}')
+            raise TypeError(f'{bad_media} are not subclasses of Medium')
 
         # Make sure all of the media have the same dimesnionality. It doesn't make sense
         # to have a transceiver that can connect to one type of medium that only exists
@@ -771,12 +768,9 @@ class Transceiver(Process, ABC):
         # the algorithm used to detect the rate/phase of the incoming signal.
         self._base_delta_ns: int = NANOSECONDS_PER_SECOND // base_baud
 
-        # The type of the shared memory used for the location depends on the number of
-        # axes that the location is defined over.
-        if (axes_count := self._supported_media[0]._dimensionality) == 1:
-            self._location: Value = Value('f', 0.0)
-        else:
-            self._location: Array = Array('f', [0.0] * axes_count)
+        self._location: Array = Array(
+            'f', [0.0] * self._supported_media[0]._dimensionality
+        )
 
         # Store the name as a value so that it can be accessed within the process.
         self._medium_name: Array = Array('c', DEFAULT_NAME)
@@ -851,21 +845,33 @@ class Transceiver(Process, ABC):
 
     @property
     def location(self) -> Location:
-        try:
-            # Is the location a single value?
-            return self._location.value
-        except AttributeError:
-            # If not, it must be an array.
-            return tuple(self._location)
+        loc = self._location[:]
+
+        if len(loc) == 1:
+            return loc[0]
+        return tuple(loc)
 
     @location.setter
     def location(self, location: Location) -> None:
-        try:
-            # Is the location a single value?
-            self._location.value = location
-        except AttributeError:
-            # If not, it must be an array.
+        # We can't rely on an AttributeError being raised if the location is a single
+        # value, so we'll go with an LBYL approach.
+        current_location = self._location[:]
+        expected_len = len(current_location)
+
+        if isinstance(location, (float, int)):
+            if expected_len == 3:
+                raise ValueError('Expected a sequence of length 3, got a scalar instead')
+            self._location[0] = location
+        elif isinstance(location, (list, tuple)):
+            if (bad_len := len(location)) != expected_len:
+                raise ValueError(
+                    f'Expected a sequence of length {expected_len}, got sequence of length {bad_len} instead'
+                )
             self._location[:] = location
+        else:
+            raise TypeError(
+                f'Expected a sequence or scalar for location, got {type(location).__name__} instead'
+            )
 
     # endregion
 
@@ -914,7 +920,6 @@ class Transceiver(Process, ABC):
     def run(self):
         log.info(f'Starting transceiver process ({self.pid})')
 
-        thread_stop_event = Event()
         current_conn: Connection = None
 
         while not self._stop_event.is_set():
@@ -926,7 +931,6 @@ class Transceiver(Process, ABC):
             if new_conn is not None:
                 # Start up a new thread which will use this connection to receive data,
                 # process it and relay the result to the next layer up.
-                thread_stop_event.clear()
                 thread = Thread(
                     target=self._monitor_medium,
                     args=(new_conn,),
@@ -938,13 +942,16 @@ class Transceiver(Process, ABC):
                 current_conn = new_conn
             else:
                 # Stop the thread which is currently receiving bits.
-                thread_stop_event.set()
                 current_conn.send(ManagementMessages.CLOSE)
                 thread.join()
 
                 current_conn.close()
                 current_conn = None
                 self._medium = None
+
+        # If we're exiting the loop, we need to make sure that the thread is joined.
+        if current_conn is not None:
+            thread.join()
 
         log.debug(f'{self}: shutting down')
 
