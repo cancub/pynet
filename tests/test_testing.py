@@ -100,7 +100,7 @@ class TestLogTestingMixin(TestCase):
             log.debug('foo')
 
 
-class MockMedium(Medium, dimensionality=1):
+class MockMedium(Medium, dimensionality=1, velocity_factor=0.7):
     """A helper class for testing the :class:`TestProcessBuilderMixin` mixin."""
 
     def _connect(self, args, **kwargs):
@@ -109,11 +109,8 @@ class MockMedium(Medium, dimensionality=1):
     def _disconnect(self, args, **kwargs):
         pass
 
-    def _process_transmission(self, args, **kwargs):
-        pass
 
-
-class MockTransceiver(Transceiver, supported_media=[MockMedium]):
+class MockTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=1500):
     """A helper class for testing the :class:`TestProcessBuilderMixin` mixin."""
 
     location: int = None
@@ -124,11 +121,11 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium]):
     def _disconnect(self, args, **kwargs):
         pass
 
-    def _process_incoming_data(self, args, **kwargs):
-        pass
+    def _process_rx_amplitude(self, amplitude, *args, **kwargs):
+        return amplitude
 
-    def _process_outgoing_data(self, args, **kwargs):
-        pass
+    def _next_tx_symbol(self, *args, **kwargs):
+        return 0
 
 
 class TestProcessBuilderMixin(TestCase):
