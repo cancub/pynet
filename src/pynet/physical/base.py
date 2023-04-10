@@ -123,17 +123,16 @@ class CommsManager:
     RX) with the former.
     """
 
-    def __init__(self, conn: Connection, init_ns: float):
+    def __init__(self, conn: Connection):
         """
         :param conn: The :class:`Medium`'s :class:`.Connection` of the :class:`.Pipe`
             between itself and a :class:`Transceiver`.
-        :param init_ns: The initial time in nanoseconds at which a :class:`Transceiver`
-            is to begin receiving.
         """
         self._conn: Connection = conn
         self._transmissions: set[Transmission] = set()
 
-        self.next_rx_ns = init_ns
+        # Start the receiver off by waiting for an active medium.
+        self.next_rx_ns = -1
 
     def _send(self, data: Any) -> None:
         """Send data to the :class:`Transceiver`.
@@ -142,6 +141,10 @@ class CommsManager:
         """
         try:
             self._conn.send(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # Alert the higher layers to the fact that the connection has very likely
+            # closed.
+            raise
         except Exception as e:
             raise ConnectionError(
                 f'Could not send data to the Transceiver via {self}: {e}'
@@ -157,26 +160,14 @@ class CommsManager:
         """
         try:
             return self._conn.recv()
+        except (BrokenPipeError, ConnectionResetError):
+            # Alert the higher layers to the fact that the connection has very likely
+            # closed.
+            raise
         except Exception as e:
             raise ConnectionError(
                 f'Could not receive data from the Transceiver via {self}: {e}'
             )
-
-    def _is_medium_idle(self, current_time: float) -> bool:
-        """Check if the :class:`Medium` is idle.
-
-        :param current_time: The current time in nanoseconds, as measured by the
-            :class:`Medium`.
-
-        :returns: ``True`` if the :class:`Medium` is idle, ``False`` otherwise.
-        """
-        if not self._transmissions:
-            return True
-
-        # The next transmission is the one that starts the soonest.
-        earliest_tx = min(self._transmissions, key=lambda t: t._start_ns)
-
-        return earliest_tx._start_ns > current_time
 
     def trigger_tx(self) -> tuple[Callable | None, float]:
         """Ping the :class:`Transceiver` to transmit a symbol and wait for a response
@@ -201,15 +192,12 @@ class CommsManager:
         TODO:
         Gracefully recover from an exception by using the previous delta time.
         """
-        if self.next_rx_ns == -1:
-            # The receiver is waiting for the medium to no longer be idle. Check if that
-            # is the case.
-            if self._is_medium_idle(current_time_ns) > 0:
-                # The medium is idle, so we don't have to do anything.
-                return
+        amplitude = self._get_amplitude(current_time_ns)
 
-        # Either the medium is not idle or the receiver is in sampling mode.
-        amplitude = self._get_amplitude()
+        if self.next_rx_ns == -1 and amplitude == 0:
+            # The medium is idle and the receiver is not in sampling mode, so there is no
+            # need to trigger a reception.
+            return
 
         self._send((CommsType.RECEIVE, amplitude))
 
@@ -238,15 +226,16 @@ class CommsManager:
             # will scale back down again when it reads from the symbol function.
             self.next_rx_ns = this_rx_ns + rx_delta_ns * TIME_DILATION_FACTOR
 
-    def _get_amplitude(self):
+    def _get_amplitude(self, current_time_ns: float):
         # Collect the summation of the current amplitudes of all of the transmissions.
         amplitude = 0.0
+        sample_time = self.next_rx_ns if self.next_rx_ns != -1 else current_time_ns
 
         # Work with a shallow copy so that we can remove transmissions from the original
         # set as we go.
         for tx in self._transmissions.copy():
             try:
-                amplitude += tx.get_amplitude(self.next_rx_ns)
+                amplitude += tx.get_amplitude(sample_time)
             except TransmissionComplete:
                 # The transmission has finished, so we must remove it from the set.
                 self._transmissions.remove(tx)
@@ -484,7 +473,7 @@ class Medium(Process, ABC):
             conn.send((Responses.ERROR, e))
             return
 
-        new_cmgr = CommsManager(conn, monotonic_ns())
+        new_cmgr = CommsManager(conn)
 
         with self._comms_details_lock:
             self._comms_details[location] = new_cmgr
@@ -537,29 +526,27 @@ class Medium(Process, ABC):
 
         # Process receptions and transmissions
         with self._comms_details_lock:
+            # NOTE:
+            # We MUST check TX events of _all_ transceivers before checking _any_ RX
+            # events, as we may need to clean up our view of ongoing transmissions and add
+            # new ones to the RX queues. For example, the 5th transceiver in the dict may
+            # be finished transmitting its first symbol and needs to start transmitting
+            # the next, but if we have a single loop going over the TX and RX events of
+            # each transceiver in the order of the dict, then we will necessarily process
+            # the receptions of the 0th transceiver before we get the new transmission
+            # from the 5th transceiver.
             for loc, cmgr in self._comms_details.items():
-                self._process_tx_rx_events(loc, cmgr, current_ns)
+                self._process_tx_events(loc, cmgr, current_ns)
+            for loc, cmgr in self._comms_details.items():
+                self._process_rx_events(loc, cmgr, current_ns)
 
-    def _process_tx_rx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
-        """Process the transmission and reception events for a single
-        :class:`Transceiver`.
+    def _process_tx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
+        """Process the transmission events for a single :class:`Transceiver`.
 
         :param loc: The location of the :class:`Transceiver`.
         :param cmgr: The :class:`CommsManager` for the :class:`Transceiver`.
         :param current_ns: The current time in nanoseconds.
         """
-        # Check if the scheduled time for the next sampling event for this transceiver has
-        # passed.
-        if cmgr.next_rx_ns <= current_ns:
-            log.debug(f'{self}: triggering rx at location={loc}')
-            try:
-                # Let the CommsManager know the current time in case the Transceiver was
-                # not sampling and was instead waiting to sense a transmission on the
-                # medium.
-                cmgr.maybe_trigger_rx(current_ns)
-            except ConnectionError as e:
-                log.error(f'{self}: error while triggering rx: {e}')
-
         # Check if the transceiver had been transmitting and if the transmission has
         # finished.
         try:
@@ -570,7 +557,7 @@ class Medium(Process, ABC):
             start_ns = current_ns
         else:
             # The transceiver had been transmitting. Now we need to check if it has
-            # completed the transmission of the symbol.
+            # completed the transmission.
             if stop_time_ns <= current_ns:
                 del self._transmission_completion_times[cmgr]
 
@@ -585,6 +572,11 @@ class Medium(Process, ABC):
         # Check if the transceiver has any symbols to transmit.
         try:
             symbol_info = cmgr.trigger_tx()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # No need for a higher level, since this is a normal occurrence triggered
+            # by a shutdown race condition.
+            log.debug(f'{self}: connection to transceiver at {loc} closed: {e}')
+            return
         except ConnectionError as e:
             log.error(f'{self}: error while triggering tx: {e}')
             return
@@ -620,6 +612,25 @@ class Medium(Process, ABC):
                 duration_ns,
                 1,  # No attenuation for now.
             )
+
+    def _process_rx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
+        # Check if the scheduled time for the next sampling event for this transceiver has
+        # passed.
+        if cmgr.next_rx_ns > current_ns:
+            return
+
+        log.debug(f'{self}: maybe triggering rx at location={loc}')
+        try:
+            # Let the CommsManager know the current time in case the Transceiver was
+            # not sampling and was instead waiting to sense a transmission on the
+            # medium.
+            cmgr.maybe_trigger_rx(current_ns)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # No need for a higher level, since this is a normal occurrence triggered
+            # by a shutdown race condition.
+            log.debug(f'{self}: connection to transceiver at {loc} closed: {e}')
+        except ConnectionError as e:
+            log.error(f'{self}: error while triggering rx: {e}')
 
     @classmethod
     @lru_cache

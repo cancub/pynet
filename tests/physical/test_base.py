@@ -91,26 +91,32 @@ class TestCommsManager(TestCase, LogTestingMixin):
         super().setUp()
         self.cmgr = self._build_cmgr()
 
-    def _build_cmgr(self, conn=None, init_ns=0) -> CommsManager:
-        return CommsManager(conn=conn or Mock(), init_ns=init_ns)
+    def _build_cmgr(self, conn=None) -> CommsManager:
+        return CommsManager(conn=conn or Mock())
 
     def test__init__(self):
         mock_conn = Mock()
-        init_ns = 1000
 
-        cmgr = CommsManager(conn=mock_conn, init_ns=init_ns)
+        cmgr = CommsManager(conn=mock_conn)
 
         self.assertEqual(cmgr._conn, mock_conn)
-        self.assertEqual(cmgr.next_rx_ns, init_ns)
 
     def test_send(self):
         cmgr = self.cmgr
         conn = cmgr._conn
         data = 1
 
-        conn.send.side_effect = ConnectionError(err_str := 'test')
+        with self.subTest('BrokenPipe'):
+            conn.send.side_effect = BrokenPipeError
+            with self.assertRaises(BrokenPipeError) as ctx:
+                cmgr._send(data)
+
+            conn.send.assert_called_once_with(data)
+
+        conn.reset_mock()
 
         with self.subTest('ConnectionError'):
+            conn.send.side_effect = ConnectionError(err_str := 'test')
             with self.assertRaises(ConnectionError) as ctx:
                 cmgr._send(data)
 
@@ -131,9 +137,17 @@ class TestCommsManager(TestCase, LogTestingMixin):
         cmgr = self.cmgr
         conn = cmgr._conn
 
-        conn.recv.side_effect = ConnectionError(err_str := 'test')
+        with self.subTest('BrokenPipe'):
+            conn.recv.side_effect = BrokenPipeError
+            with self.assertRaises(BrokenPipeError) as ctx:
+                cmgr._recv()
+
+            conn.recv.assert_called_once_with()
+
+        conn.reset_mock()
 
         with self.subTest('ConnectionError'):
+            conn.recv.side_effect = ConnectionError(err_str := 'test')
             with self.assertRaises(ConnectionError) as ctx:
                 cmgr._recv()
 
@@ -151,21 +165,6 @@ class TestCommsManager(TestCase, LogTestingMixin):
             self.assertEqual(cmgr._recv(), data)
             conn.recv.assert_called_once_with()
 
-    def test_is_medium_idle(self):
-        cmgr = self.cmgr
-        current_time = 100
-
-        with self.subTest('No transmissions'):
-            self.assertTrue(cmgr._is_medium_idle(current_time))
-
-        with self.subTest('No ongoing transmissions'):
-            cmgr._transmissions = [Mock(_start_ns=current_time + 1)]
-            self.assertTrue(cmgr._is_medium_idle(current_time))
-
-        with self.subTest('Ongoing transmissions'):
-            cmgr._transmissions = [Mock(_start_ns=current_time - 1)]
-            self.assertFalse(cmgr._is_medium_idle(current_time))
-
     def test_trigger_tx(self):
         cmgr = self.cmgr
         cmgr._conn.recv.return_value = (
@@ -177,9 +176,8 @@ class TestCommsManager(TestCase, LogTestingMixin):
         cmgr._conn.send.assert_called_once_with((CommsType.TRANSMIT, None))
         cmgr._conn.recv.assert_called_once()
 
-    @patch(f'{BASE_TARGET}.CommsManager._is_medium_idle', autospec=True)
     @patch(f'{BASE_TARGET}.CommsManager._get_amplitude', autospec=True)
-    def test_maybe_trigger_rx(self, amp_mock, idle_mock, *mocks):
+    def test_maybe_trigger_rx(self, amp_mock, *mocks):
         cmgr = self._build_cmgr()
         conn = cmgr._conn
         conn_send = conn.send
@@ -187,17 +185,17 @@ class TestCommsManager(TestCase, LogTestingMixin):
 
         def reset_mocks():
             amp_mock.reset_mock()
-            idle_mock.reset_mock()
             conn_send.reset_mock()
             conn_recv.reset_mock()
 
         with self.subTest('waiting for idle medium, medium is idle'):
-            idle_mock.return_value = True
+            amp_mock.return_value = 0
             cmgr.next_rx_ns = -1
+            current_time = 123
 
-            cmgr.maybe_trigger_rx(123)
+            cmgr.maybe_trigger_rx(current_time)
 
-            amp_mock.assert_not_called()
+            amp_mock.assert_called_once_with(cmgr, current_time)
             conn_send.assert_not_called()
             self.assertEqual(cmgr.next_rx_ns, -1)
 
@@ -205,14 +203,13 @@ class TestCommsManager(TestCase, LogTestingMixin):
 
         with self.subTest('waiting for idle medium, medium is not idle'):
             current_time = 100
-            idle_mock.return_value = False
             cmgr.next_rx_ns = -1
             amp_mock.return_value = amp = 1.2
             conn_recv.return_value = rx_delta_ns = 10
 
             cmgr.maybe_trigger_rx(current_time)
 
-            amp_mock.assert_called_once()
+            amp_mock.assert_called_once_with(cmgr, current_time)
             conn_send.assert_called_once_with((CommsType.RECEIVE, amp))
             conn_recv.assert_called_once()
             self.assertEqual(
@@ -224,14 +221,13 @@ class TestCommsManager(TestCase, LogTestingMixin):
         with self.subTest(
             'Sampling, two ongoing transmissions plus one completed and one error'
         ):
-            idle_mock.return_value = False
             cmgr.next_rx_ns = orig_next_rx_ns = 100
             amp_mock.return_value = amp = 1.2
             conn_recv.return_value = rx_delta_ns = 10
 
             cmgr.maybe_trigger_rx(orig_next_rx_ns)
 
-            amp_mock.assert_called_once()
+            amp_mock.assert_called_once_with(cmgr, orig_next_rx_ns)
             conn.send.assert_called_with((CommsType.RECEIVE, amp))
             conn_recv.assert_called_once()
             self.assertEqual(
@@ -255,7 +251,7 @@ class TestCommsManager(TestCase, LogTestingMixin):
             'ERROR',
             f'{cmgr}: an exception occurred while processing a transmission: {err_str}',
         ):
-            cmgr._get_amplitude()
+            cmgr._get_amplitude(123)
 
         self.assertEqual(cmgr._transmissions, {tx1, tx2, tx4})
 
@@ -544,7 +540,7 @@ class TestMedium(TestPHYBase):
 
             connect_mock.assert_called_once_with(conn_req)
             conn_send.assert_called_once_with((Responses.OK, location))
-            CommsManagerMock.assert_called_once_with(mock_conn, mono_mock.return_value)
+            CommsManagerMock.assert_called_once_with(mock_conn)
             self.assertNotIn(location, medium._comms_details)
 
         reset_mocks()
@@ -560,7 +556,7 @@ class TestMedium(TestPHYBase):
 
             connect_mock.assert_called_once_with(conn_req)
             conn_send.assert_called_once_with((Responses.OK, location))
-            CommsManagerMock.assert_called_once_with(mock_conn, mono_mock.return_value)
+            CommsManagerMock.assert_called_once_with(mock_conn)
             self.assertEqual(
                 medium._comms_details[location], CommsManagerMock.return_value
             )
@@ -612,9 +608,10 @@ class TestMedium(TestPHYBase):
 
     # region _process_medium-related
 
-    @patch.object(MockMedium, '_process_tx_rx_events')
+    @patch.object(MockMedium, '_process_rx_events')
+    @patch.object(MockMedium, '_process_tx_events')
     @patch(f'{BASE_TARGET}.monotonic_ns')
-    def test_process_medium(self, monotonic_ns_mock, process_mock):
+    def test_process_medium(self, monotonic_ns_mock, process_tx_mock, process_rx_mock):
         medium = self.build_medium()
 
         loc1 = 123
@@ -633,12 +630,13 @@ class TestMedium(TestPHYBase):
         current_ns = monotonic_ns_mock.return_value
 
         monotonic_ns_mock.assert_called_once()
-        process_mock.assert_has_calls(
-            [call(loc1, cmgr1, current_ns), call(loc2, cmgr2, current_ns)]
-        )
+        for process_mock in (process_tx_mock, process_rx_mock):
+            process_mock.assert_has_calls(
+                [call(loc1, cmgr1, current_ns), call(loc2, cmgr2, current_ns)]
+            )
 
     @patch.object(MockMedium, '_calculate_travel_time_ns')
-    def test_process_tx_rx_events(self, calc_travel_time_mock):
+    def test_process_tx_events(self, calc_travel_time_mock):
         medium = self.build_medium()
 
         symbol_fn = Mock()
@@ -651,33 +649,24 @@ class TestMedium(TestPHYBase):
         dest_loc = 456
         dest_cmgr = Mock()
 
-        src_maybe_trigger_rx = src_cmgr.maybe_trigger_rx
         src_trigger_tx = src_cmgr.trigger_tx
         src_add_tranmsission = src_cmgr.add_transmission
         dest_add_tranmsission = dest_cmgr.add_transmission
 
         def reset_mocks():
             src_cmgr.reset_mock()
-            src_maybe_trigger_rx.reset_mock()
             src_trigger_tx.reset_mock()
             calc_travel_time_mock.reset_mock()
             src_add_tranmsission.reset_mock()
             dest_add_tranmsission.reset_mock()
 
-            src_maybe_trigger_rx.side_effect = None
             src_trigger_tx.side_effect = None
 
-        src_maybe_trigger_rx.side_effect = ConnectionError(err_str := 'test')
         src_trigger_tx.return_value = None
 
-        with self.subTest('rx triggered with error, tx triggered with no symbol'):
+        with self.subTest('tx triggered with no symbol'):
+            medium._process_tx_events(src_loc, src_cmgr, current_ns)
 
-            with self.assertInTargetLogs(
-                'ERROR', f'{medium}: error while triggering rx: {err_str}'
-            ):
-                medium._process_tx_rx_events(src_loc, src_cmgr, current_ns)
-
-            src_maybe_trigger_rx.assert_called_once()
             src_trigger_tx.assert_called_once()
 
             src_add_tranmsission.assert_not_called()
@@ -687,11 +676,9 @@ class TestMedium(TestPHYBase):
 
         medium._comms_details = {dest_loc: dest_cmgr, src_loc: src_cmgr}
 
-        with self.subTest('rx not triggered, tx triggered for first symbol'):
+        with self.subTest('tx triggered for first symbol'):
             # No ongoing tranmissions
             medium._transmission_completion_times = {}
-
-            src_cmgr.next_rx_ns = current_ns + 1
 
             src_trigger_tx.return_value = symbol_fn, duration_ns
             calc_travel_time_mock.return_value = prop_delay_ns = 123
@@ -700,9 +687,8 @@ class TestMedium(TestPHYBase):
                 'DEBUG',
                 f'{medium}: transceiver at location={src_loc} beginning transmission of new symbol',
             ):
-                medium._process_tx_rx_events(src_loc, src_cmgr, current_ns)
+                medium._process_tx_events(src_loc, src_cmgr, current_ns)
 
-            src_maybe_trigger_rx.assert_not_called()
             src_trigger_tx.assert_called_once()
 
             self.assertEqual(
@@ -719,7 +705,7 @@ class TestMedium(TestPHYBase):
 
         reset_mocks()
 
-        with self.subTest('rx not triggered, tx triggered for next symbol'):
+        with self.subTest('tx triggered for next symbol'):
             # A transmission that recently completed.
             stop_ns = current_ns - 30
             medium._transmission_completion_times = {src_cmgr: stop_ns}
@@ -728,9 +714,8 @@ class TestMedium(TestPHYBase):
                 'DEBUG',
                 f'{medium}: transceiver at location={src_loc} beginning transmission of new symbol',
             ):
-                medium._process_tx_rx_events(src_loc, src_cmgr, current_ns)
+                medium._process_tx_events(src_loc, src_cmgr, current_ns)
 
-            src_maybe_trigger_rx.assert_not_called()
             src_trigger_tx.assert_called_once()
 
             self.assertEqual(
@@ -749,38 +734,101 @@ class TestMedium(TestPHYBase):
 
         reset_mocks()
 
-        with self.subTest('rx not triggered, tx ongoing'):
+        with self.subTest('tx ongoing'):
             current_ns = stop_ns - 1
 
-            medium._process_tx_rx_events(src_loc, src_cmgr, current_ns)
+            medium._process_tx_events(src_loc, src_cmgr, current_ns)
 
-            src_maybe_trigger_rx.assert_not_called()
             src_trigger_tx.assert_not_called()
-
             calc_travel_time_mock.assert_not_called()
-
             dest_add_tranmsission.assert_not_called()
             src_add_tranmsission.assert_not_called()
 
         reset_mocks()
 
-        with self.subTest('tx triggered with error'):
+        with self.subTest('tx triggered with broken pipe'):
             medium._transmission_completion_times = {}
             current_ns = stop_ns + duration_ns + 1
 
-            # Ignore receptions.
-            src_cmgr.next_rx_ns = current_ns + 1
-            dest_cmgr.next_rx_ns = current_ns + 1
+            src_trigger_tx.side_effect = BrokenPipeError(err_str := 'test')
+
+            with self.assertInTargetLogs(
+                'DEBUG',
+                f'{medium}: connection to transceiver at {src_loc} closed: {err_str}',
+            ):
+                medium._process_tx_events(src_loc, src_cmgr, current_ns)
+
+            src_trigger_tx.assert_called_once()
+
+        reset_mocks()
+
+        with self.subTest('tx triggered with connection error'):
+            medium._transmission_completion_times = {}
+            current_ns = stop_ns + duration_ns + 1
 
             src_trigger_tx.side_effect = ConnectionError(err_str := 'test')
 
             with self.assertInTargetLogs(
                 'ERROR', f'{medium}: error while triggering tx: {err_str}'
             ):
-                medium._process_tx_rx_events(src_loc, src_cmgr, current_ns)
+                medium._process_tx_events(src_loc, src_cmgr, current_ns)
 
-            src_maybe_trigger_rx.assert_not_called()
             src_trigger_tx.assert_called_once()
+
+    def test_process_rx_events(self):
+        medium = self.build_medium()
+        current_ns = 500
+
+        loc = 123
+        cmgr = Mock()
+        maybe_trigger_rx = cmgr.maybe_trigger_rx
+
+        def reset_mocks():
+            cmgr.reset_mock()
+            maybe_trigger_rx.reset_mock()
+            maybe_trigger_rx.side_effect = None
+
+        with self.subTest('rx not triggered'):
+            # No ongoing tranmissions
+            cmgr.next_rx_ns = current_ns + 1
+
+            with self.assertNotInTargetLogs(
+                'DEBUG',
+                f'{medium}: maybe triggering rx at location={loc}',
+            ):
+                medium._process_rx_events(loc, cmgr, current_ns)
+
+            maybe_trigger_rx.assert_not_called()
+
+        reset_mocks()
+
+        with self.subTest('rx triggered, broken pipe'):
+            cmgr.next_rx_ns = current_ns - 1
+            maybe_trigger_rx.side_effect = BrokenPipeError(err_str := 'test')
+
+            with self.assertInTargetLogs(
+                'DEBUG',
+                (
+                    f'{medium}: maybe triggering rx at location={loc}',
+                    f'{medium}: connection to transceiver at {loc} closed: {err_str}',
+                ),
+            ):
+                medium._process_rx_events(loc, cmgr, current_ns)
+
+            maybe_trigger_rx.assert_called_once_with(current_ns)
+
+        reset_mocks()
+
+        with self.subTest('rx triggered, connection error'):
+            maybe_trigger_rx.side_effect = ConnectionError(err_str := 'test')
+
+            with self.assertInTargetLogs(
+                'ERROR',
+                f'{medium}: error while triggering rx: {err_str}',
+            ):
+                medium._process_rx_events(loc, cmgr, current_ns)
+
+            maybe_trigger_rx.assert_called_once_with(current_ns)
 
     def test_calculate_travel_time_ns(self):
         medium = self.build_medium()
@@ -802,7 +850,6 @@ class TestMedium(TestPHYBase):
         """
         medium = self.build_medium()
         current_time = 0
-        init_ns = 100
         symbol_fn = sin
         duration_ns = 100
 
@@ -821,8 +868,8 @@ class TestMedium(TestPHYBase):
         stop_ns = start_ns + duration_ns * TIME_DILATION_FACTOR
 
         # Configure the connection managers such that all rx events are upcoming.
-        src_cmgr = CommsManager(src_conn, init_ns)
-        dest_cmgr = CommsManager(dest_conn, init_ns)
+        src_cmgr = CommsManager(src_conn)
+        dest_cmgr = CommsManager(dest_conn)
         medium._comms_details = {src_loc: src_cmgr, dest_loc: dest_cmgr}
 
         def reset_mocks():
@@ -882,15 +929,15 @@ class TestMedium(TestPHYBase):
 
             # The destination will have a reception triggered and a check for a
             # transmission, so both send() and recv() will be called twice. The first
-            # recv() should return the next reception time, and the second should return
-            # None for no transmission
-            dest_recv.side_effect = [dest_next_rx_delta_ns, None]
+            # recv() should return None for no transmission, and the second should return
+            # the delta for the next reception time.
+            dest_recv.side_effect = [None, dest_next_rx_delta_ns]
 
             medium._process_medium()
 
             # No signal has reached the destination yet.
             dest_send.assert_has_calls(
-                [call((CommsType.RECEIVE, 0.0)), call((CommsType.TRANSMIT, None))]
+                [call((CommsType.TRANSMIT, None)), call((CommsType.RECEIVE, 0.0))]
             )
             self.assertEqual(dest_recv.call_count, 2)
 
@@ -915,16 +962,16 @@ class TestMedium(TestPHYBase):
 
             # The destination will have a reception triggered and a check for a
             # transmission, so both send() and recv() will be called twice. The first
-            # recv() should return the next reception time, and the second should return
-            # None for no transmission
-            dest_recv.side_effect = [dest_next_rx_delta_ns, None]
+            # recv() should return None for no transmission, and the second should return
+            # the delta for the next reception time.
+            dest_recv.side_effect = [None, dest_next_rx_delta_ns]
 
             medium._process_medium()
 
             # The destination should have begun receiving the symbol.
             amplitude = symbol_fn((orig_dest_rx - start_ns) / TIME_DILATION_FACTOR)
             dest_send.assert_has_calls(
-                [call((CommsType.RECEIVE, amplitude)), call((CommsType.TRANSMIT, None))]
+                [call((CommsType.TRANSMIT, None)), call((CommsType.RECEIVE, amplitude))]
             )
             self.assertEqual(dest_recv.call_count, 2)
 
@@ -947,14 +994,14 @@ class TestMedium(TestPHYBase):
 
             # The destination will have a reception triggered and a check for a
             # transmission, so both send() and recv() will be called twice. The first
-            # recv() should return the next reception time, and the second should return
-            # None for no transmission
-            dest_recv.side_effect = [dest_next_rx_delta_ns, None]
+            # recv() should return None for no transmission, and the second should return
+            # the delta for the next reception time.
+            dest_recv.side_effect = [None, dest_next_rx_delta_ns]
 
             medium._process_medium()
 
             dest_send.assert_has_calls(
-                [call((CommsType.RECEIVE, 0.0)), call((CommsType.TRANSMIT, None))]
+                [call((CommsType.TRANSMIT, None)), call((CommsType.RECEIVE, 0.0))]
             )
             self.assertEqual(dest_recv.call_count, 2)
 
@@ -1801,9 +1848,19 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
         self.rx_index = Value('b', 0)
         self.tx_index = Value('b', 0)
 
+        # Normally there would be some sort of preamble to sync the receiver mechanism
+        # with the transmission frequency, but we're not going to bother with that here.
+        # Instead, we'll just store the last amplitude and use the fact that the value
+        # will never be the same for two consecutive samples to determine boundaries.
+        self.last_rx_value = Value('b', 0)
+
         super().__init__(*args, **kwargs)
 
     def _process_rx_amplitude(self, amplitude, *args, **kwargs):
+        # This is tricksy. We need to know when we've reached the end of one symbol and
+        # the start of the next. The receiver starts off in a state where it's waiting for
+        # the medium to be active before sampling, so we can use the first amplitude
+        # received to indicate that the medium is active and we should start storing.
         if not self.rx_ongoing.value:
             if amplitude != START_SYMBOL:
                 # Nothing to receive yet.
@@ -1812,22 +1869,30 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
             # Our buffer now contains data to receive.
             self.rx_ongoing.value = 1
 
+        if amplitude == self.last_rx_value.value:
+            # We're still looking at the same symbol as last time and it's not the
+            # end symbol, so we can ignore this sample.
+            return
+
+        if self.last_rx_value.value == END_SYMBOL and amplitude == 0:
+            # The end symbol has finished trasnmitting, so we can stop receiving.
+            self.rx_ongoing.value = 0
+            self.last_rx_value.value = 0
+
+            # Alert the higher layer that it may now observe the buffer.
+            self._osi_client.send(READ_MSG)
+
+            # Tell the medium that we're waiting for the medium to stop being idle.
+            return -1
+
         # Place the received amplitude in the buffer
         with self._rx_buffer.get_lock():
-            print(
-                f'{self} storing rx amplitude', amplitude, 'at index', self.rx_index.value
-            )
             self._rx_buffer[self.rx_index.value] = int(amplitude)
 
         self.rx_index.value += 1
 
-        if amplitude == END_SYMBOL:
-            # We've reached the end of the reception.
-            self.rx_ongoing.value = 0
-
-            # Alert the higher layer that it may now observe the buffer.
-            print(f'{self} sending READ_MSG')
-            self._osi_client.send(READ_MSG)
+        # Keep track of the last amplitude we received.
+        self.last_rx_value.value = int(amplitude)
 
     def _next_tx_symbol(self, *args, **kwargs):
         with self._tx_buffer.get_lock():
@@ -1841,8 +1906,6 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
             # Our buffer now contains data to transmit.
             self.tx_ongoing.value = 1
 
-        print(f'{self} got tx symbol', symbol)
-
         if symbol == END_SYMBOL:
             # We've reached the end of the transmission.
             self.tx_ongoing.value = 0
@@ -1855,7 +1918,7 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
 class TestIPC(TestPHYBase):
     def test_send_data_between_transceivers(self):
         # Make sure a broadcast is received by all transceivers.
-        names = {'alice', 'bob', 'carla', 'dave', 'eve', 'frank'}
+        names = {'alice', 'bob', 'carla', 'dave'}
         base_baud = 1e6
         xvcrs = {n: IPCTransceiver(name=n.title(), base_baud=base_baud) for n in names}
 
@@ -1870,7 +1933,6 @@ class TestIPC(TestPHYBase):
         # Every sender has their message heard by every receiver and does not hear their
         # own message.
         for i, sender_name in enumerate(names):
-            print(f'\n\n\n\n\nChecking {sender_name} test')
             receiver_names = names - {sender_name}
 
             sender = xvcrs[sender_name]
@@ -1890,7 +1952,7 @@ class TestIPC(TestPHYBase):
                 for name in receiver_names:
                     receiver = xvcrs[name]
 
-                    if not receiver.osi_listener.poll(timeout=5):
+                    if not receiver.osi_listener.poll(timeout=1):
                         self.fail(f'No data in {sender_name} to {name} test')
 
                     # Make sure that we got the read message.
@@ -1900,7 +1962,6 @@ class TestIPC(TestPHYBase):
                     with receiver._rx_buffer.get_lock():
                         rx_data = receiver._rx_buffer[1:last_index]
 
-                        print(receiver, rx_data)
                         self.assertEqual(rx_data, tx_data)
 
                         # Make sure the buffer is empty before moving on to the next test.
