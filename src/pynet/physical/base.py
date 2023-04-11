@@ -7,6 +7,7 @@ how data is transmitted over the media.
 :author: Alf O'Kenney
 
 TODO:
+- active bit in transceiver
 - add in-process init to allow users to initialize certain values that only really need to
   be used within the process
     - if they are created in __init__ then they must be Value or Array objects, which is
@@ -22,6 +23,7 @@ TODO:
 - allow users to define the environment (e.g., temperature, humidity, walls, buildings,
     etc.) in which the transceivers and media are located
         - this will have on impact on what, if anything is received by devices
+- make the medium robust to delays so that we can decrease the time dilation factor
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ __all__ = ['Medium', 'Transceiver']
 
 log = logging.getLogger(__name__)
 
+Number = int | float
 
 ConnRequest = namedtuple('ConnRequest', ['conn', 'location', 'create', 'kwargs'])
 
@@ -65,7 +68,7 @@ class Transmission:
 
     def __init__(
         self,
-        symbol: int | float | Callable,
+        symbol: Number | Callable,
         start_ns: float,
         duration_ns: float,
         attenuation: float,
@@ -86,7 +89,7 @@ class Transmission:
         self._attenuation = attenuation
 
     @cached_property
-    def _symbol_fn(self) -> Callable[[int | float], float]:
+    def _symbol_fn(self) -> Callable[[Number], float]:
         """A function that takes a single argument, the time since the start of the
         transmission, and returns the amplitude of the symbol at that time.
         """
@@ -247,7 +250,7 @@ class CommsManager:
 
     def add_transmission(
         self,
-        symbol: Callable | int | float,
+        symbol: Callable | Number,
         start_ns: float,
         duration_ns: float,
         attenuation: float = 1.0,
@@ -878,7 +881,7 @@ class Transceiver(Process, ABC):
     # region Abstract methods
 
     @abstractmethod
-    def _process_rx_amplitude(self, amplitude: float | int):
+    def _process_rx_amplitude(self, amplitude: Number):
         """Process the amplitude value received from the medium. It is up to the
         subclasses to determine what to do with the result (e.g., buffer, decode), and it
         will eventually be stored in the :attr:`_rx_buffer` and made available to the next
@@ -887,7 +890,7 @@ class Transceiver(Process, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _next_tx_symbol(self) -> float | int | None:
+    def _next_tx_symbol(self) -> Number | None:
         """Provide us with the next symbol to be put on the medium. It is up to the
         subclasses to determine how to do this (e.g., encoding), and the result will be
         sent to the medium via the :attr:`_tx_queue`. For example, a :class:`Transceiver`
@@ -998,7 +1001,7 @@ class Transceiver(Process, ABC):
         # connection on our end.
         conn.close()
 
-    def _process_reception_event(self, conn: Connection, amplitude: int | float):
+    def _process_reception_event(self, conn: Connection, amplitude: Number):
         """
         It's the responsibility of the subclass to determine what to do with the observed
         amplitude (e.g., how to manipulate/decode it, where to put it). Addtionally, the
@@ -1092,6 +1095,100 @@ class Transceiver(Process, ABC):
             conn.send((symbol, self._base_delta_ns))
         except Exception as e:
             log.error(f'{self}: Error sending symbol function to medium: {e}')
+
+    # endregion
+
+    # region Buffer interaction
+
+    def _set_rx_buffer_data(self, data: Sequence | int, start_index: int = 0) -> None:
+        """Set the contents of the receive buffer.
+        NOTE:
+        This only overwrites the contents of the receive buffer from the start index to
+        the length of the incoming data. If the incoming data is shorter than the current
+        contents of the receive buffer, the remaining contents will be left unchanged.
+
+        :param data: The data to use to replace the current contents of the receive
+            buffer.
+        :param start_index: The index at which to start writing the incoming data.
+        """
+        end_index = len(data) + start_index
+        self._rx_buffer[start_index:end_index] = data
+
+    def _set_rx_buffer_element(self, value: int, index: int) -> None:
+        """Set a single element in the receive buffer
+
+        :param value: The value to set the element to.
+        :param index: The index of the element to set.
+        """
+        self._rx_buffer[index] = value
+
+    def clear_rx_buffer(self) -> None:
+        """Clear the contents of the receive buffer"""
+        self._rx_buffer[:] = [0] * len(self._rx_buffer)
+
+    def get_rx_buffer_data(self, start_index: int = 0, end_index: int = None) -> list:
+        """Get the contents of the receive buffer
+
+        :param start_index: The index at which to start reading the receive buffer.
+        :param end_index: The index at which to stop reading the receive buffer. If not
+            provided, the remainder of the receive buffer will be returned.
+        :return: The contents of the receive buffer
+        """
+        end_index = end_index or len(self._tx_buffer)
+        return self._rx_buffer[start_index:end_index]
+
+    def get_rx_buffer_element(self, index: int) -> int:
+        """Get a single element from the receive buffer
+
+        :param index: The index of the element to get.
+        :return: The element at the given index.
+        """
+        return self._rx_buffer[index]
+
+    def set_tx_buffer_data(self, data: Sequence, start_index: int = 0) -> None:
+        """Set the contents of the transmit buffer
+        NOTE:
+        This only overwrites the contents of the transmit buffer from the start index to
+        the length of the incoming data. If the incoming data is shorter than the current
+        contents of the transmit buffer, the remaining contents will be left unchanged.
+
+        :param data: The data to use to replace the current contents of the transmit
+            buffer.
+        :param start_index: The index at which to start writing the incoming data.
+        """
+        end_index = len(data) + start_index
+        self._tx_buffer[start_index:end_index] = data
+
+    def set_tx_buffer_element(self, value: int, index: int) -> None:
+        """Set a single element in the transmit buffer
+
+        :param value: The value to set the element to.
+        :param index: The index of the element to set.
+        """
+        self._tx_buffer[index] = value
+
+    def get_tx_buffer_data(self, start_index: int = 0, end_index: int = None) -> list:
+        """Get the contents of the transmit buffer
+
+        :param start_index: The index at which to start reading the transmit buffer.
+        :param end_index: The index at which to stop reading the transmit buffer. If not
+            provided, the remainder of the transmit buffer will be returned.
+        :return: The contents of the transmit buffer
+        """
+        end_index = end_index or len(self._tx_buffer)
+        return self._tx_buffer[start_index:end_index]
+
+    def get_tx_buffer_element(self, index: int) -> int:
+        """Get a single element from the transmit buffer
+
+        :param index: The index of the element to retrieve.
+        :return: The element at the given index.
+        """
+        return self._tx_buffer[index]
+
+    def clear_tx_buffer(self) -> None:
+        """Clear the contents of the transmit buffer"""
+        self._tx_buffer[:] = [0] * len(self._tx_buffer)
 
     # endregion
 

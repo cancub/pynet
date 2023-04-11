@@ -2021,6 +2021,87 @@ class TestTransceiver(TestPHYBase):
 
     # endregion
 
+    # region buffer interaction
+
+    def test_set_rx_buffer_element(self):
+        xcvr = self.build_xcvr()
+
+        xcvr._set_rx_buffer_element(data := 1, index := 2)
+        self.assertEqual(xcvr._rx_buffer[index], data)
+
+    def test_set_rx_buffer_data(self):
+        xcvr = self.build_xcvr()
+        xcvr._set_rx_buffer_data(data := [1, 2, 3], start := 1)
+        end = start + len(data)
+        self.assertEqual(xcvr._rx_buffer[start:end], data)
+
+    def test_clear_rx_buffer(self):
+        xcvr = self.build_xcvr()
+
+        xcvr._rx_buffer = [1, 2, 3]
+        xcvr.clear_rx_buffer()
+
+        self.assertEqual(xcvr._rx_buffer, [0] * len(xcvr._rx_buffer))
+
+    def test_get_rx_buffer_data(self):
+        xcvr = self.build_xcvr()
+        xcvr._rx_buffer[:3] = [1, 2, 3]
+
+        with self.subTest('default == all'):
+            self.assertEqual(xcvr.get_rx_buffer_data(), xcvr._rx_buffer[:])
+
+        with self.subTest('with start and end indices provided'):
+            self.assertEqual(
+                xcvr.get_rx_buffer_data(start := 1, end := 3), xcvr._rx_buffer[start:end]
+            )
+
+    def test_get_rx_buffer_element(self):
+        xcvr = self.build_xcvr()
+        index = 2
+        xcvr._rx_buffer[index] = data = 1
+        self.assertEqual(xcvr.get_rx_buffer_element(index), data)
+
+    def test_set_tx_buffer_element(self):
+        xcvr = self.build_xcvr()
+
+        xcvr.set_tx_buffer_element(data := 1, index := 2)
+        self.assertEqual(xcvr._tx_buffer[index], data)
+
+    def test_set_tx_buffer_data(self):
+        xcvr = self.build_xcvr()
+
+        xcvr.set_tx_buffer_data(data := [1, 2, 3], start := 1)
+        end = start + len(data)
+        self.assertEqual(xcvr._tx_buffer[start:end], data)
+
+    def test_clear_tx_buffer(self):
+        xcvr = self.build_xcvr()
+
+        xcvr._tx_buffer = [1, 2, 3]
+        xcvr.clear_tx_buffer()
+
+        self.assertEqual(xcvr._tx_buffer, [0] * len(xcvr._tx_buffer))
+
+    def test_get_tx_buffer_data(self):
+        xcvr = self.build_xcvr()
+        xcvr._tx_buffer[:3] = [1, 2, 3]
+
+        with self.subTest('default == all'):
+            self.assertEqual(xcvr.get_tx_buffer_data(), xcvr._tx_buffer[:])
+
+        with self.subTest('with start and end indices provided'):
+            self.assertEqual(
+                xcvr.get_tx_buffer_data(start := 1, end := 3), xcvr._tx_buffer[start:end]
+            )
+
+    def test_get_tx_buffer_element(self):
+        xcvr = self.build_xcvr()
+        index = 2
+        xcvr._tx_buffer[index] = data = 1
+        self.assertEqual(xcvr.get_tx_buffer_element(index), data)
+
+    # endregion
+
     # region other public methods
 
     @patch(f'{BASE_TARGET}.Event', autospec=True)
@@ -2175,8 +2256,7 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
             return -1
 
         # Place the received amplitude in the buffer
-        with self._rx_buffer.get_lock():
-            self._rx_buffer[self.rx_index.value] = int(amplitude)
+        self._set_rx_buffer_element(int(amplitude), self.rx_index.value)
 
         self.rx_index.value += 1
 
@@ -2184,8 +2264,7 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
         self.last_rx_value.value = int(amplitude)
 
     def _next_tx_symbol(self, *args, **kwargs):
-        with self._tx_buffer.get_lock():
-            symbol = self._tx_buffer[self.tx_index.value]
+        symbol = self.get_tx_buffer_element(self.tx_index.value)
 
         if not self.tx_ongoing.value:
             if symbol != START_SYMBOL:
@@ -2231,10 +2310,7 @@ class TestIPC(TestPHYBase):
             tx_data = list(range(i, i + tx_data_len))
 
             with sender._tx_buffer.get_lock():
-                sender._tx_buffer[0] = START_SYMBOL
-                for j in range(tx_data_len):
-                    sender._tx_buffer[j + 1] = tx_data[j]
-                sender._tx_buffer[j + 2] = END_SYMBOL
+                sender.set_tx_buffer_data([START_SYMBOL] + tx_data + [END_SYMBOL])
 
             with self.subTest(sender=sender_name, receivers=receiver_names):
                 # Each of the receivers should have received the data.
@@ -2249,13 +2325,12 @@ class TestIPC(TestPHYBase):
 
                     # Observe and consume the data.
                     with receiver._rx_buffer.get_lock():
-                        rx_data = receiver._rx_buffer[1:last_index]
+                        rx_data = receiver.get_rx_buffer_data(1, last_index)
 
                         self.assertEqual(rx_data, tx_data)
 
                         # Make sure the buffer is empty before moving on to the next test.
-                        for j in range(tx_data_len + 2):
-                            receiver._rx_buffer[j] = 0
+                        receiver.clear_rx_buffer()
 
                         receiver.rx_index.value = 0
 
@@ -2264,8 +2339,7 @@ class TestIPC(TestPHYBase):
 
             # Clear the sender's transmit buffer.
             with sender._tx_buffer.get_lock():
-                for j in range(tx_data_len + 2):
-                    sender._tx_buffer[j] = 0
+                sender.clear_tx_buffer()
 
                 sender.tx_index.value = 0
 
