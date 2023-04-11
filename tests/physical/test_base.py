@@ -1113,6 +1113,20 @@ class TestMedium(TestPHYBase):
 
     # endregion
 
+    # region misc
+
+    def test_init_shared_objects(self):
+        test_val = 123
+
+        class MyMedium(MockMedium, dimensionality=1, velocity_factor=0.77):
+            def _init_shared_objects(self):
+                self._test_val = Value('i', test_val)
+
+        medium = MyMedium(name='foo')
+        self.assertEqual(medium._test_val.value, test_val)
+
+    # endregion
+
 
 class TestTransceiver(TestPHYBase):
     def setUp(self):
@@ -2167,6 +2181,22 @@ class TestTransceiver(TestPHYBase):
 
     # endregion
 
+    # region misc
+
+    def test_init_shared_objects(self):
+        test_val = 123
+
+        class MyTransceiver(
+            MockTransceiver, supported_media=[MockMedium], buffer_bytes=1
+        ):
+            def _init_shared_objects(self):
+                self._test_val = Value('i', test_val)
+
+        xcvr = MyTransceiver(name='foo', base_baud=100)
+        self.assertEqual(xcvr._test_val.value, test_val)
+
+    # endregion
+
 
 class TestMisc(TestCase, ProcessBuilderMixin):
     def test_cleanup_processes(self):
@@ -2211,7 +2241,7 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
     single item from the tx and rx buffers.
     """
 
-    def __init__(self, *args, **kwargs):
+    def _init_shared_objects(self):
         self.rx_ongoing = Value('b', 0)
         self.tx_ongoing = Value('b', 0)
 
@@ -2223,8 +2253,6 @@ class IPCTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=16)
         # Instead, we'll just store the last amplitude and use the fact that the value
         # will never be the same for two consecutive samples to determine boundaries.
         self.last_rx_value = Value('b', 0)
-
-        super().__init__(*args, **kwargs)
 
     def _process_rx_amplitude(self, amplitude, *args, **kwargs):
         # This is tricksy. We need to know when we've reached the end of one symbol and

@@ -375,6 +375,8 @@ class Medium(Process, ABC):
         #   2. replace a completed symbol transmission with a new one (if available)
         self._transmission_completion_times: dict[CommsManager, int] = {}
 
+        self._init_shared_objects()
+
         # By default, we do the caller the service of starting up the Process rather than
         # making them remember to do it for each and every Medium instance.
         if auto_start:
@@ -408,6 +410,13 @@ class Medium(Process, ABC):
     # endregion
 
     # region Optional overrides
+
+    def _init_shared_objects(self):
+        """Run any initialization logic required before the process starts. Users can
+        always define an `__init__` method that ensures shared object initialization
+        before calling `super().__init__`, but this method makes that process
+        idiot-proof."""
+        pass
 
     def _disconnect(self, *args, **kwargs):
         """Run class-specific disconnection logic"""
@@ -812,6 +821,8 @@ class Transceiver(Process, ABC):
         self._tx_buffer: Array = Array('b', [0] * self._buffer_bytes)
         self._rx_buffer: Array = Array('b', [0] * self._buffer_bytes)
 
+        self._init_shared_objects()
+
         # By default, we do the caller the service of starting up the Process rather than
         # making them remember to do it for each and every Transceiver instance.
         if auto_start:
@@ -907,6 +918,13 @@ class Transceiver(Process, ABC):
     # endregion
 
     # region Optional overrides
+
+    def _init_shared_objects(self):
+        """Run any initialization logic required before the process starts. Users can
+        always define an `__init__` method that ensures shared object initialization
+        before calling `super().__init__`, but this method makes that process
+        idiot-proof."""
+        pass
 
     def _connect(self, medium: Medium, **kwargs):
         """Class-specific connection logic"""
