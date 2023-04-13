@@ -32,6 +32,7 @@ import atexit
 import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property, lru_cache
 from multiprocessing import Array, Event, Lock, Pipe, Process, Queue
 from multiprocessing.connection import Connection
@@ -373,7 +374,8 @@ class Medium(Process, ABC):
         # need to keep track of the completion times of these signals in order to:
         #   1. avoid unnecessary polling of transceivers that are already transmitting
         #   2. replace a completed symbol transmission with a new one (if available)
-        self._transmission_completion_times: dict[CommsManager, int] = {}
+        self._tx_end_times: dict[CommsManager, int] = {}
+        self._tx_end_times_lock: Lock = Lock()
 
         self._init_shared_objects()
 
@@ -533,9 +535,9 @@ class Medium(Process, ABC):
         # Get and store current time in nanoseconds.
         current_ns = monotonic_ns()
 
-        # Process receptions and transmissions
-        with self._comms_details_lock:
-            # NOTE:
+        # Process receptions and transmissions. We'll work with a thread pool to ensure
+        # that no one rx or tx blocks the loop for too long
+        with self._comms_details_lock, ThreadPoolExecutor(max_workers=5) as executor:
             # We MUST check TX events of _all_ transceivers before checking _any_ RX
             # events, as we may need to clean up our view of ongoing transmissions and add
             # new ones to the RX queues. For example, the 5th transceiver in the dict may
@@ -544,10 +546,29 @@ class Medium(Process, ABC):
             # each transceiver in the order of the dict, then we will necessarily process
             # the receptions of the 0th transceiver before we get the new transmission
             # from the 5th transceiver.
-            for loc, cmgr in self._comms_details.items():
-                self._process_tx_events(loc, cmgr, current_ns)
-            for loc, cmgr in self._comms_details.items():
-                self._process_rx_events(loc, cmgr, current_ns)
+            future_to_tx_loc = {
+                executor.submit(self._process_tx_events, loc, cmgr, current_ns): loc
+                for loc, cmgr in self._comms_details.items()
+            }
+            for future in as_completed(future_to_tx_loc):
+                loc = future_to_tx_loc[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    log.error(f'{self}: tx exception in {loc=}: {e}')
+
+            # Now that the transmissions are processed, we can safely move on to
+            # receptions.
+            future_to_rx_loc = {
+                executor.submit(self._process_rx_events, loc, cmgr, current_ns): loc
+                for loc, cmgr in self._comms_details.items()
+            }
+            for future in as_completed(future_to_rx_loc):
+                loc = future_to_rx_loc[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    log.error(f'{self}: rx exception in {loc=}: {e}')
 
     def _process_tx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
         """Process the transmission events for a single :class:`Transceiver`.
@@ -559,7 +580,10 @@ class Medium(Process, ABC):
         # Check if the transceiver had been transmitting and if the transmission has
         # finished.
         try:
-            stop_time_ns = self._transmission_completion_times[cmgr]
+            # NOTE:
+            # No need to lock for a read operation with a CommsManager to which only we
+            # have access.
+            stop_time_ns = self._tx_end_times[cmgr]
         except KeyError:
             # The transceiver is not transmitting, so we can assume that if it has
             # anything to transmit, it just started.
@@ -568,7 +592,8 @@ class Medium(Process, ABC):
             # The transceiver had been transmitting. Now we need to check if it has
             # completed the transmission.
             if stop_time_ns <= current_ns:
-                del self._transmission_completion_times[cmgr]
+                with self._tx_end_times_lock:
+                    del self._tx_end_times[cmgr]
 
                 # If there is another symbol to transmit, we need to schedule the
                 # transmission of that symbol immediately after the end of the current
@@ -602,9 +627,8 @@ class Medium(Process, ABC):
         )
 
         # Keep track of the transmission so that we can check if it has finished.
-        self._transmission_completion_times[cmgr] = (
-            start_ns + duration_ns * TIME_DILATION_FACTOR
-        )
+        with self._tx_end_times_lock:
+            self._tx_end_times[cmgr] = start_ns + duration_ns * TIME_DILATION_FACTOR
 
         # Add the symbol to the set of transmission functions of each of the other
         # transceivers.

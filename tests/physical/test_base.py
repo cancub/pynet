@@ -370,7 +370,7 @@ class TestMedium(TestPHYBase):
 
                 self.assertEqual(medium._dimensionality, MockMedium._dimensionality)
                 self.assertEqual(medium._comms_details, {})
-                self.assertEqual(medium._transmission_completion_times, {})
+                self.assertEqual(medium._tx_end_times, {})
 
                 self.assertIsInstance(medium._comms_details_lock, Lock)
                 self.assertIsInstance(medium._connection_queue, Queue)
@@ -676,6 +676,35 @@ class TestMedium(TestPHYBase):
                 [call(loc1, cmgr1, current_ns), call(loc2, cmgr2, current_ns)]
             )
 
+    @patch.object(MockMedium, '_process_rx_events')
+    @patch.object(MockMedium, '_process_tx_events')
+    def test_process_medium_thread_errors(self, process_tx_mock, process_rx_mock):
+        process_tx_mock.side_effect = Exception(tx_err_str := 'tx exception')
+        process_rx_mock.side_effect = Exception(rx_err_str := 'rx exception')
+
+        medium = self.build_medium()
+
+        loc1 = 123
+        loc2 = 456
+
+        cmgr1 = Mock()
+        cmgr2 = Mock()
+
+        medium._comms_details = {loc1: cmgr1, loc2: cmgr2}
+
+        tx_logs = [
+            f'{medium}: tx exception in {loc=}: {tx_err_str}'
+            for loc in medium._comms_details
+        ]
+
+        rx_logs = [
+            f'{medium}: rx exception in {loc=}: {rx_err_str}'
+            for loc in medium._comms_details
+        ]
+
+        with self.assertInTargetLogs('ERROR', tx_logs + rx_logs):
+            medium._process_medium()
+
     @patch.object(MockMedium, '_calculate_travel_time_ns')
     def test_process_tx_events(self, calc_travel_time_mock):
         medium = self.build_medium()
@@ -719,7 +748,7 @@ class TestMedium(TestPHYBase):
 
         with self.subTest('tx triggered for first symbol'):
             # No ongoing tranmissions
-            medium._transmission_completion_times = {}
+            medium._tx_end_times = {}
 
             src_trigger_tx.return_value = symbol_fn, duration_ns
             calc_travel_time_mock.return_value = prop_delay_ns = 123
@@ -733,7 +762,7 @@ class TestMedium(TestPHYBase):
             src_trigger_tx.assert_called_once()
 
             self.assertEqual(
-                medium._transmission_completion_times,
+                medium._tx_end_times,
                 {src_cmgr: current_ns + duration_ns * TIME_DILATION_FACTOR},
             )
 
@@ -749,7 +778,7 @@ class TestMedium(TestPHYBase):
         with self.subTest('tx triggered for next symbol'):
             # A transmission that recently completed.
             stop_ns = current_ns - 30
-            medium._transmission_completion_times = {src_cmgr: stop_ns}
+            medium._tx_end_times = {src_cmgr: stop_ns}
 
             with self.assertInTargetLogs(
                 'DEBUG',
@@ -760,7 +789,7 @@ class TestMedium(TestPHYBase):
             src_trigger_tx.assert_called_once()
 
             self.assertEqual(
-                medium._transmission_completion_times,
+                medium._tx_end_times,
                 {src_cmgr: stop_ns + duration_ns * TIME_DILATION_FACTOR},
             )
 
@@ -788,7 +817,7 @@ class TestMedium(TestPHYBase):
         reset_mocks()
 
         with self.subTest('tx triggered with broken pipe'):
-            medium._transmission_completion_times = {}
+            medium._tx_end_times = {}
             current_ns = stop_ns + duration_ns + 1
 
             src_trigger_tx.side_effect = BrokenPipeError(err_str := 'test')
@@ -804,7 +833,7 @@ class TestMedium(TestPHYBase):
         reset_mocks()
 
         with self.subTest('tx triggered with connection error'):
-            medium._transmission_completion_times = {}
+            medium._tx_end_times = {}
             current_ns = stop_ns + duration_ns + 1
 
             src_trigger_tx.side_effect = ConnectionError(err_str := 'test')
@@ -1049,7 +1078,7 @@ class TestMedium(TestPHYBase):
             # There are no transmissions in sight anywhere.
             self.assertEqual(src_cmgr._transmissions, set())
             self.assertEqual(dest_cmgr._transmissions, set())
-            self.assertEqual(medium._transmission_completion_times, {})
+            self.assertEqual(medium._tx_end_times, {})
 
     # endregion
 
