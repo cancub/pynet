@@ -7,6 +7,8 @@ how data is transmitted over the media.
 :author: Alf O'Kenney
 
 TODO:
+- Make each symbol actually a tuple of symbol and duration, so that we can
+    support modulation and frequency hopping.
 - active bit in transceiver
 - add in-process init to allow users to initialize certain values that only really need to
   be used within the process
@@ -32,13 +34,13 @@ import atexit
 import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property, lru_cache
-from multiprocessing import Array, Event, Lock, Pipe, Process, Queue
-from multiprocessing.connection import Connection
+from math import inf as _inf
+from multiprocessing import Array, Event, Lock, Pipe, Process
+from multiprocessing.connection import Connection, wait as conn_wait
 from threading import Thread
 from time import monotonic_ns
-from typing import Any, Callable, Sequence
+from typing import Callable, Sequence
 from weakref import WeakValueDictionary
 
 from .constants import (
@@ -47,10 +49,14 @@ from .constants import (
     SPEED_OF_LIGHT,
     TIME_DILATION_FACTOR,
     ManagementMessages,
-    CommsType,
     Responses,
 )
-from .exceptions import ConnectionError, ProcessNotRunningError, TransmissionComplete
+from .exceptions import (
+    ConnectionError,
+    ProcessNotRunningError,
+    StopProcess,
+    TransmissionComplete,
+)
 from ..space import Location, euclidean_distance
 
 
@@ -59,8 +65,19 @@ __all__ = ['Medium', 'Transceiver']
 log = logging.getLogger(__name__)
 
 Number = int | float
+Symbol = Number | Callable
 
 ConnRequest = namedtuple('ConnRequest', ['conn', 'location', 'create', 'kwargs'])
+
+
+@lru_cache
+def _dilate_time(real_time: int) -> int:
+    return real_time * TIME_DILATION_FACTOR
+
+
+@lru_cache
+def _undilate_time(dilated_time: int) -> int:
+    return dilated_time / TIME_DILATION_FACTOR
 
 
 class Transmission:
@@ -69,7 +86,7 @@ class Transmission:
 
     def __init__(
         self,
-        symbol: Number | Callable,
+        symbol: Symbol,
         start_ns: float,
         duration_ns: float,
         attenuation: float,
@@ -86,11 +103,11 @@ class Transmission:
         """
         self._symbol = symbol
         self._start_ns = start_ns
-        self._stop_ns = start_ns + duration_ns * TIME_DILATION_FACTOR
+        self._stop_ns = start_ns + duration_ns
         self._attenuation = attenuation
 
     @cached_property
-    def _symbol_fn(self) -> Callable[[Number], float]:
+    def _symbol_fn(self) -> Callable:
         """A function that takes a single argument, the time since the start of the
         transmission, and returns the amplitude of the symbol at that time.
         """
@@ -110,133 +127,74 @@ class Transmission:
         if time_ns >= self._stop_ns:
             raise TransmissionComplete
 
-        # We need to de-dilate the time to get the correct amplitude because the main
-        # medium process is sampling at a slower rate than the transceivers would be in
-        # real life. That is, the difference between the start time and the current time
-        # is TIME_DILATION_FACTOR times larger than it would be in real life.
-        actual_ns = (time_ns - self._start_ns) / TIME_DILATION_FACTOR
+        # We need to undilate the time to get the correct amplitude. We are sampling at a
+        # lower rate than the transceivers would be in real life. That is, the difference
+        # between the start time and the current time is TIME_DILATION_FACTOR times larger
+        # than it would be in real life.
+        actual_ns = _undilate_time(time_ns - self._start_ns)
         return self._symbol_fn(actual_ns) * self._attenuation
 
 
-class CommsManager:
-    """A container for managing the relationship between a :class:`Transceiver` and a
-    :class:`Medium` which the latter uses to trigger all communications (i.e., both TX and
-    RX) with the former.
+class ReceptionManager:
+    """A class for managing incoming transmissions from a :class:`Medium`.
+    :class:`Transceiver`s add :class:`Transmission`s to this object upon being notified by
+    the :class:`Medium` that a transmission has been received. The :class:`Transceiver`
+    then uses thsi object to measure the energy of the medium at a specified time. It is
+    the responsibility of this class to ensure that the transceivers are reading the
+    aggregated amplitude of all transmissions at this time.
     """
 
-    def __init__(self, conn: Connection):
-        """
-        :param conn: The :class:`Medium`'s :class:`.Connection` of the :class:`.Pipe`
-            between itself and a :class:`Transceiver`.
-        """
-        self._conn: Connection = conn
+    def __init__(self):
         self._transmissions: set[Transmission] = set()
 
-        # Start the receiver off by waiting for an active medium.
-        self.next_rx_ns = -1
-
-    def _send(self, data: Any) -> None:
-        """Send data to the :class:`Transceiver`.
-
-        :param data: The data to send to the :class:`Transceiver`.
+    @property
+    def next_rx_ns(self) -> int:
+        """Walk trhough the transmission that are on the way and return the earliest start
+        time.
         """
-        try:
-            self._conn.send(data)
-        except (BrokenPipeError, ConnectionResetError):
-            # Alert the higher layers to the fact that the connection has very likely
-            # closed.
-            raise
-        except Exception as e:
-            raise ConnectionError(
-                f'Could not send data to the Transceiver via {self}: {e}'
-            )
+        if not self._transmissions:
+            return _inf
 
-    def _recv(self) -> Any:
-        """Receive data from the :class:`Transceiver`.
+        # Find the transmission that will arrive (arrove?) first
+        return min(tx._start_ns for tx in self._transmissions)
 
-        :returns: The data received from the :class:`Transceiver`.
+    def add_transmission(
+        self,
+        symbol: Callable | Number,
+        start_ns: float,
+        duration_ns: float,
+        attenuation: float = 1.0,
+    ):
+        """Used by the :class:`Transceiver` to update the set of transmissions it is going
+        to receive.
 
-        TODO:
-        Add a timeout
+        :param symbol: Either a static amplitude or a function that takes the time since
+            the start of the transmission as its input and returns the amplitude of the
+            signal at that time.
+        :param start_ns: The time in nanoseconds (in the :class:`Transceiver`'s clock) at
+        which the transmission begins.
+        :param duration_ns: The duration of the transmission (dilated / from the
+            :class:`Transceiver` object's perspective) in nanoseconds.
+        :param attenuation: The attenuation of the transmission once it reaches the
+            :class:`Transceiver`.
         """
-        try:
-            return self._conn.recv()
-        except (BrokenPipeError, ConnectionResetError):
-            # Alert the higher layers to the fact that the connection has very likely
-            # closed.
-            raise
-        except Exception as e:
-            raise ConnectionError(
-                f'Could not receive data from the Transceiver via {self}: {e}'
-            )
+        self._transmissions.add(Transmission(symbol, start_ns, duration_ns, attenuation))
 
-    def trigger_tx(self) -> tuple[Callable | None, float]:
-        """Ping the :class:`Transceiver` to transmit a symbol and wait for a response
-        containing the function describing the symbol to be transmitted and the duration
-        of the symbol in nanoseconds.
+    def get_amplitude(self, time_ns: float) -> float:
+        """Read the aggregated amplitude of all transmissions at a given time.
 
-        :returns: A tuple containing:
-            - a function describing the amplitude of a symbol over time
-            - the duration in nanoseconds for the symbol to be put on the link.
+        :param time_ns: The time in nanoseconds at which to read the amplitude.
+
+        :returns: The aggregated amplitude of all transmissions at the given time.
         """
-        self._send((CommsType.TRANSMIT, None))
-
-        return self._recv()
-
-    def maybe_trigger_rx(self, current_time_ns: float) -> None:
-        """Send the summation of the various symbol amplitudes at this time to the
-        :class:`Transceiver`.
-
-        :param current_time_ns: The time in nanoseconds from the pespective of the
-            :class:`Medium`.
-
-        TODO:
-        Gracefully recover from an exception by using the previous delta time.
-        """
-        amplitude = self._get_amplitude(current_time_ns)
-
-        if self.next_rx_ns == -1 and amplitude == 0:
-            # The medium is idle and the receiver is not in sampling mode, so there is no
-            # need to trigger a reception.
-            return
-
-        self._send((CommsType.RECEIVE, amplitude))
-
-        # The transceiver will respond with the delta time to the next rx event.
-        rx_delta_ns = self._recv()
-
-        if rx_delta_ns == -1:
-            # The transceiver wishes to only be contacted when the medium is no longer
-            # idle.
-            # NOTE:
-            # We set to -1 so that the medium will always attempt to trigger a reception.
-            self.next_rx_ns = -1
-        else:
-            # The transceiver wants to keep sampling, so update the next rx time.
-            if self.next_rx_ns == -1:
-                # The medium was previously idle, so there was no previous sample time and
-                # we need to instead offset from the current time.
-                this_rx_ns = current_time_ns
-            else:
-                # We're continuing from a previous sample time.
-                this_rx_ns = self.next_rx_ns
-
-            # NOTE:
-            # We need to scale up the time to allow us to operate at a slower rate than
-            # the transceivers would be in real life. Don't worry, the Transmission object
-            # will scale back down again when it reads from the symbol function.
-            self.next_rx_ns = this_rx_ns + rx_delta_ns * TIME_DILATION_FACTOR
-
-    def _get_amplitude(self, current_time_ns: float):
         # Collect the summation of the current amplitudes of all of the transmissions.
         amplitude = 0.0
-        sample_time = self.next_rx_ns if self.next_rx_ns != -1 else current_time_ns
 
         # Work with a shallow copy so that we can remove transmissions from the original
         # set as we go.
         for tx in self._transmissions.copy():
             try:
-                amplitude += tx.get_amplitude(sample_time)
+                amplitude += tx.get_amplitude(time_ns)
             except TransmissionComplete:
                 # The transmission has finished, so we must remove it from the set.
                 self._transmissions.remove(tx)
@@ -247,27 +205,28 @@ class CommsManager:
                     f'{self}: an exception occurred while processing a transmission: {e}'
                 )
 
-        return amplitude
 
-    def add_transmission(
-        self,
-        symbol: Callable | Number,
-        start_ns: float,
-        duration_ns: float,
-        attenuation: float = 1.0,
-    ):
-        """Used by the :class:`Medium` to update the set of transmissions to be received
-        by the :class:`Transceiver`.
+class ConnDetails:
+    """A container for the connection details between a :class:`Transceiver` and a
+    :class:`Medium`.
+    """
 
-        :param symbol: Either a static amplitude or a function that takes the time since
-            the start of the transmission as its input and returns the amplitude of the
-            signal at that time.
-        :param start_ns: The global time in nanoseconds at which the transmission begins.
-        :param duration_ns: The duration of the transmission in nanoseconds.
-        :param attenuation: The attenuation of the transmission once it reaches the
-            :class:`Transceiver`.
+    def __init__(self, loc: Location, current_ns: int):
         """
-        self._transmissions.add(Transmission(symbol, start_ns, duration_ns, attenuation))
+        :param loc: The location of the :class:`Transceiver` relative to the
+            :class:`Medium`.
+        :param current_ns: The current time in nanoseconds.
+        """
+        self.location: Location = loc
+
+        # The last time the medium received a signal from the transceiver and the last
+        # time the medium sent a signal to the transceiver, respectively. Both values are
+        # from the perspective of the medium and both are set to be the current time,
+        # since the creation of a connection between the transceiver and the medium
+        # implies that the medium has received a message from the transceiver and sent a
+        # reply to the transceiver.
+        self.last_rx_ns: float = current_ns
+        self.last_tx_ns: float = current_ns
 
 
 class Medium(Process, ABC):
@@ -357,25 +316,22 @@ class Medium(Process, ABC):
 
         self._connection_thread: Thread = None
 
-        # The dict of details about connected transceiver, and the lock used to ensure
+        # The dict of details about connected transceivers, and the lock used to ensure
         # thread safety.
-        self._comms_details: dict[Location, CommsManager] = {}
-        self._comms_details_lock: Lock = Lock()
+        self._conn_details: dict[Location, ConnDetails] = {}
+        self._conn_details_lock: Lock = Lock()
 
-        # The Queue monitored by the worker thread for updates to state of connected
-        # Transceivers.
-        self._connection_queue: Queue = Queue()
+        # The connection over which the main process uses to communicated the addition or
+        # removal of transceivers from the link. The client is used to forward connection
+        # requests from Transceivers into the Medium process and the listener is monitored
+        # within the process.
+        conn_listener, conn_client = Pipe(duplex=False)
+        self._connections_client: Connection = conn_client
+        self._connections_listener: Connection = conn_listener
 
         # This event is used to stop both ourselves (the forked Process) and Thread
         # workers.
         self._stop_event: Event = Event()
-
-        # At any given moment, one or more Transceivers may be transmitting a signal. We
-        # need to keep track of the completion times of these signals in order to:
-        #   1. avoid unnecessary polling of transceivers that are already transmitting
-        #   2. replace a completed symbol transmission with a new one (if available)
-        self._tx_end_times: dict[CommsManager, int] = {}
-        self._tx_end_times_lock: Lock = Lock()
 
         self._init_shared_objects()
 
@@ -426,34 +382,47 @@ class Medium(Process, ABC):
 
     # endregion
 
-    # region Multi-processing- / IPC-related methods
+    # region Multiprocessing- / IPC-related methods
+
+    @property
+    def _connections(self) -> tuple[Connection]:
+        """Return a tuple of connections to the `Medium` for all of the connected
+        `Transceiver`s.
+        """
+        with self._conn_details_lock:
+            return tuple(self._conn_details)
 
     def run(self):
         log.info(f'Starting medium process ({self.pid})')
 
-        # Start the worker thread to monitor connection changes.
-        self._connection_thread = Thread(target=self._monitor_connections)
-        self._connection_thread.start()
-
-        # Run the main loop.
         while not self._stop_event.is_set():
-            self._process_medium()
-
-        self._connection_thread.join()
+            for conn in conn_wait((*self._connections, self._connections_listener)):
+                if conn is self._connections_listener:
+                    try:
+                        self._process_connections()
+                    except StopProcess:
+                        # We've been told to stop, so we do so while also ensuring any
+                        # threads are alerted to the fact that they should stop.
+                        self._stop_event.set()
+                        break
+                else:
+                    self._process_tx_event(conn)
 
         log.debug(f'{self}: shutting down')
 
-    def _monitor_connections(self):
-        """To be run in a separate thread, this method watches the connections queue for
-        updates to the set of connected transceivers and connects or disconnects them as
-        appropriate."""
-        log.info(f'Starting connection worker thread ({self.pid})')
-
-        while not self._stop_event.is_set():
-            # Wait for a connection update.
-            conn_req = self._connection_queue.get()
-            if conn_req is ManagementMessages.CLOSE:
-                break
+    def _process_connections(self):
+        """This method processes the connections `Connection` for updates to the set of
+        connected transceivers and connects or disconnects them as appropriate.
+        """
+        while self._connections_listener.poll():
+            try:
+                conn_req = self._connections_listener.recv()
+            except EOFError:
+                log.debug(f'{self}: connection listener closed')
+                raise StopProcess from None
+            except Exception as e:
+                log.error(f'{self}: connection listener error: {e}')
+                continue
 
             try:
                 create = conn_req.create
@@ -467,27 +436,30 @@ class Medium(Process, ABC):
             else:
                 self._remove_connection(conn_req)
 
-        log.info(f'Connection worker thread exiting ({self.pid})')
-
     def _add_connection(self, conn_req: ConnRequest):
         """Add a connection between a :class:`Transceiver` and this :class:`Medium` and
         return the details of this connection to the :class:`Transceiver`.
 
         :param creq: The connection request to use to configure the connection.
         """
+        now = monotonic_ns()
         conn = conn_req.conn
 
         try:
             location = self._connect(conn_req)
         except Exception as e:
             log.error(f'{self}: connection failed: {e}')
-            conn.send((Responses.ERROR, e))
+
+            try:
+                conn.send((Responses.ERROR, e))
+            except Exception as e:
+                log.error(f'{self}: connection error reply to transceiver failed: {e}')
             return
 
-        new_cmgr = CommsManager(conn)
+        new_conn_details = ConnDetails(location, now)
 
-        with self._comms_details_lock:
-            self._comms_details[location] = new_cmgr
+        with self._conn_details_lock:
+            self._conn_details[conn] = new_conn_details
 
         # Send the location back to the transceiver to confirm that everything is okay.
         try:
@@ -500,8 +472,8 @@ class Medium(Process, ABC):
             # The order might be odd, but it prevents race conditions where transceivers
             # begin to transmit immediately after the connection is established and other
             # transceivers are still being added in a loop
-            with self._comms_details_lock:
-                del self._comms_details[location]
+            with self._conn_details_lock:
+                del self._conn_details[conn]
             return
 
         log.info(f'{self}: connection established at {location=}')
@@ -523,161 +495,144 @@ class Medium(Process, ABC):
             )
 
         log.info(f'{self}: closing connection at location={conn_req.location}')
-        with self._comms_details_lock:
+        with self._conn_details_lock:
             # Make sure to not just remove the connection, but also to close it.
-            self._comms_details.pop(conn_req.location)._conn.close()
-
-    def _process_medium(self):
-        """Process the transceivers for transmission events and medium sampling, storing
-        transmission signal functions in the applicable receivers with the applicable
-        delays.
-        """
-        # Get and store current time in nanoseconds.
-        current_ns = monotonic_ns()
-
-        # Process receptions and transmissions. We'll work with a thread pool to ensure
-        # that no one rx or tx blocks the loop for too long
-        with self._comms_details_lock, ThreadPoolExecutor(max_workers=5) as executor:
-            # We MUST check TX events of _all_ transceivers before checking _any_ RX
-            # events, as we may need to clean up our view of ongoing transmissions and add
-            # new ones to the RX queues. For example, the 5th transceiver in the dict may
-            # be finished transmitting its first symbol and needs to start transmitting
-            # the next, but if we have a single loop going over the TX and RX events of
-            # each transceiver in the order of the dict, then we will necessarily process
-            # the receptions of the 0th transceiver before we get the new transmission
-            # from the 5th transceiver.
-            future_to_tx_loc = {
-                executor.submit(self._process_tx_events, loc, cmgr, current_ns): loc
-                for loc, cmgr in self._comms_details.items()
-            }
-            for future in as_completed(future_to_tx_loc):
-                loc = future_to_tx_loc[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    log.error(f'{self}: tx exception in {loc=}: {e}')
-
-            # Now that the transmissions are processed, we can safely move on to
-            # receptions.
-            future_to_rx_loc = {
-                executor.submit(self._process_rx_events, loc, cmgr, current_ns): loc
-                for loc, cmgr in self._comms_details.items()
-            }
-            for future in as_completed(future_to_rx_loc):
-                loc = future_to_rx_loc[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    log.error(f'{self}: rx exception in {loc=}: {e}')
-
-    def _process_tx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
-        """Process the transmission events for a single :class:`Transceiver`.
-
-        :param loc: The location of the :class:`Transceiver`.
-        :param cmgr: The :class:`CommsManager` for the :class:`Transceiver`.
-        :param current_ns: The current time in nanoseconds.
-        """
-        # Check if the transceiver had been transmitting and if the transmission has
-        # finished.
-        try:
-            # NOTE:
-            # No need to lock for a read operation with a CommsManager to which only we
-            # have access.
-            stop_time_ns = self._tx_end_times[cmgr]
-        except KeyError:
-            # The transceiver is not transmitting, so we can assume that if it has
-            # anything to transmit, it just started.
-            start_ns = current_ns
-        else:
-            # The transceiver had been transmitting. Now we need to check if it has
-            # completed the transmission.
-            if stop_time_ns <= current_ns:
-                with self._tx_end_times_lock:
-                    del self._tx_end_times[cmgr]
-
-                # If there is another symbol to transmit, we need to schedule the
-                # transmission of that symbol immediately after the end of the current
-                # transmission.
-                start_ns = stop_time_ns
-            else:
-                # The transceiver is still transmitting.
+            try:
+                self._conn_details.pop(conn := conn_req.conn)
+            except KeyError:
+                log.info(f'{self}: connection not found: {conn}')
                 return
 
-        # Check if the transceiver has any symbols to transmit.
+            conn.close()
+
+    def _process_tx_event(self, src_conn: Connection):
+        """Process a transmission event for a :class:`Transceiver`.
+
+        :param src_conn: The connection to the :class:`Transceiver` which is transmitting.
+        """
+        # Get the symbol and delta for this transmission.
         try:
-            symbol_info = cmgr.trigger_tx()
-        except (BrokenPipeError, ConnectionResetError) as e:
-            # No need for a higher level, since this is a normal occurrence triggered
-            # by a shutdown race condition.
-            log.debug(f'{self}: connection to transceiver at {loc} closed: {e}')
-            return
-        except ConnectionError as e:
-            log.error(f'{self}: error while triggering tx: {e}')
-            return
-
-        if symbol_info is None or symbol_info is ManagementMessages.CLOSE:
-            # The transceiver has nothing to transmit.
-            return
-
-        # Oh, it's transmitting, alright.
-        symbol, duration_ns = symbol_info
-
-        log.debug(
-            f'{self}: transceiver at location={loc} beginning transmission of new symbol'
-        )
-
-        # Keep track of the transmission so that we can check if it has finished.
-        with self._tx_end_times_lock:
-            self._tx_end_times[cmgr] = start_ns + duration_ns * TIME_DILATION_FACTOR
-
-        # Add the symbol to the set of transmission functions of each of the other
-        # transceivers.
-        for dest_loc, dest_cmgr in self._comms_details.items():
-            if dest_cmgr is cmgr:
-                continue
-
-            # TODO:
-            # Allow for a calculation of signal attenuation based on distance.
-            log.debug(f'{self}: adding transmission to set for location={dest_loc}')
-            dest_cmgr.add_transmission(
-                symbol,
-                start_ns + self._calculate_travel_time_ns(loc, dest_loc),
-                duration_ns,
-                1,  # No attenuation for now.
+            tx_details = src_conn.recv()
+        except EOFError:
+            # It's possible that the transceiver is dead without having been disconnected.
+            # Given that the connection is closed, we should just remove it.
+            log.info(
+                f'{self}: connection to {src_conn} closed. Removing from connections.'
             )
 
-    def _process_rx_events(self, loc: Location, cmgr: CommsManager, current_ns: int):
-        # Check if the scheduled time for the next sampling event for this transceiver has
-        # passed.
-        if cmgr.next_rx_ns > current_ns:
+            with self._conn_details_lock:
+                try:
+                    del self._conn_details[src_conn]
+                except KeyError:
+                    pass
+
+            return
+        except Exception as e:
+            log.error(f'{self}: unexpected exception while receiving tx details: {e}')
             return
 
-        log.debug(f'{self}: maybe triggering rx at location={loc}')
         try:
-            # Let the CommsManager know the current time in case the Transceiver was
-            # not sampling and was instead waiting to sense a transmission on the
-            # medium.
-            cmgr.maybe_trigger_rx(current_ns)
-        except (BrokenPipeError, ConnectionResetError) as e:
-            # No need for a higher level, since this is a normal occurrence triggered
-            # by a shutdown race condition.
-            log.debug(f'{self}: connection to transceiver at {loc} closed: {e}')
-        except ConnectionError as e:
-            log.error(f'{self}: error while triggering rx: {e}')
+            symbol, ns_since_last_xcvr_tx, dilated_duration_ns = tx_details
+        except (ValueError, TypeError):
+            log.error(f'{self}: unexpected transmission details: {tx_details}')
+            return
+
+        with self._conn_details_lock:
+            # Get the connection details for this transceiver.
+            src_conn_details = self._conn_details[src_conn]
+
+            # Use the delta and the last transmission time for this transceiver to
+            # determine when this transmission was scheduled to be sent from our
+            # perspective.
+            local_tx_time_ns = src_conn_details.last_tx_ns + ns_since_last_xcvr_tx
+
+            # Keep track of this new "last" time for the source transceiver.
+            src_conn_details.last_tx_ns = local_tx_time_ns
+
+            # Relay the symbol and the deltas to all other transceivers.
+            for dest_conn, dest_conn_details in self._conn_details.items():
+                if dest_conn is src_conn:
+                    continue
+
+                self._effectuate_transmission(
+                    src_conn_details.location,
+                    dest_conn,
+                    dest_conn_details,
+                    local_tx_time_ns,
+                    dilated_duration_ns,
+                    symbol,
+                )
+
+    def _effectuate_transmission(
+        self,
+        src_loc: Location,
+        dest_conn: Connection,
+        dest_details: ConnDetails,
+        local_tx_time_ns: int,
+        dilated_duration_ns: int,
+        symbol: Symbol,
+    ):
+        # Determine the delta between the this transmission and the last time we
+        # sent something to this destination.
+        xcvr_rx_delta_ns = local_tx_time_ns - dest_details.last_rx_ns
+
+        # Sort the locations to take advantage of the invertible nature of the
+        # travel time calculation.
+        # TODO:
+        # Test if this is efficient for both small and large numbers of
+        # transceivers as well as at the beginning of a simulation when there are
+        # no cached travel times and when the simulation has been running for a
+        # while and there are many cached travel times.
+        dilated_prop_delay_ns = self._calculate_travel_time_ns(
+            *sorted((src_loc, dest_details.location)),
+            dilate=True,
+        )
+
+        try:
+            dest_conn.send(
+                (
+                    symbol,
+                    xcvr_rx_delta_ns,
+                    dilated_prop_delay_ns,
+                    dilated_duration_ns,
+                    1,  # No attenuation for now.
+                )
+            )
+        except Exception as e:
+            log.error(
+                (
+                    f'{self}: unexpected exception while sending tx details to '
+                    f'location={dest_details.location}: {e}'
+                )
+            )
+
+            # Do not to update the last transmission time for this destination (since we
+            # didn't actually send anything).
+            return
+
+        # Update the last time we sent something to this destination.
+        dest_details.last_rx_ns = local_tx_time_ns
 
     @classmethod
     @lru_cache
-    def _calculate_travel_time_ns(self, src_loc: Location, dest_loc: Location) -> float:
+    def _calculate_travel_time_ns(
+        self, loc_1: Location, loc_2: Location, dilate: bool = True
+    ) -> float:
         """Calculate the time (in nanoseconds) it takes for a signal to travel from one
         location to another in this medium."""
-        return euclidean_distance(src_loc, dest_loc) / self._medium_velocity_ns
+        real_ns = euclidean_distance(loc_1, loc_2) / self._medium_velocity_ns
+
+        if dilate:
+            return _dilate_time(real_ns)
+
+        return real_ns
 
     # endregion
 
     # region Public methods
 
     def connect(self, conn: Connection, location: Location = None, **kwargs):
-        """Communicate with the connection worker thread to establish a connection with a
+        """Communicate with the worker process to establish a connection with a
         :class:`Transceiver`.
 
         :param conn: our :class:`~multiprocessing.Connection` to the
@@ -686,11 +641,10 @@ class Medium(Process, ABC):
             If not provided, the :class:`Transceiver` will be placed at an location
             determined by the medium.
         """
-        self._connection_queue.put(ConnRequest(conn, location, True, kwargs))
+        self._connections_client.send(ConnRequest(conn, location, True, kwargs))
 
-    def disconnect(self, location: Location, **kwargs):
-        """Communicate with the connection worker thread to disconnect a
-        :class:`Transceiver`.
+    def disconnect(self, conn: Connection, location: Location, **kwargs):
+        """Communicate with the worker process to disconnect a :class:`Transceiver`.
 
         NOTE:
         At some point we may want to add a check to make sure that the transceiver
@@ -698,7 +652,7 @@ class Medium(Process, ABC):
 
         :param location: the location of the :class:`Transceiver` in the medium.
         """
-        self._connection_queue.put(ConnRequest(None, location, False, kwargs))
+        self._connections_client.send(ConnRequest(conn, location, False, kwargs))
 
     def stop(self):
         """Let the worker thread break out of its processing loop in addition to the
@@ -710,7 +664,7 @@ class Medium(Process, ABC):
         self._stop_event.set()
 
         try:
-            self._connection_queue.put(ManagementMessages.CLOSE)
+            self._connections_client.send(ManagementMessages.CLOSE)
         except ValueError:
             # This can happen if the queue has been closed
             pass
@@ -730,7 +684,7 @@ class Medium(Process, ABC):
 
 
 class Transceiver(Process, ABC):
-    """A base class for all transceivers. A transceiver is a device that can send and
+    """The base class for all transceivers. A transceiver is a device that can send and
     receive data over a physical medium. In PyNet, a :class:`Transceiver` instance is
     responsible for connecting to a :class:`Medium` instance."""
 
@@ -761,7 +715,7 @@ class Transceiver(Process, ABC):
         if bad_media:
             raise TypeError(f'{bad_media} are not subclasses of Medium')
 
-        # Make sure all of the media have the same dimesnionality. It doesn't make sense
+        # Make sure all of the media have the same dimensionality. It doesn't make sense
         # to have a transceiver that can connect to one type of medium that only exists
         # in 1D (e.g., coax) and another that exists in 3D (air).
         if len(set(m._dimensionality for m in supported_media)) != 1:
@@ -799,10 +753,24 @@ class Transceiver(Process, ABC):
         self.name: str = name
         self._medium: Medium = None
 
+        # Keep track of the next and last times associated with transfer of symbols
+        # between the transceiver and the medium. The next times are used to determine
+        # when to perform an action on our end, whereas the last times are used for
+        # synchronization with the medium.
+        self._next_rx_ns: int = None
+        self._next_tx_ns: int = None
+        self._last_medium_rx_ns: int = None
+        self._last_medium_tx_ns: int = None
+
+        self._tx_frame_symbols: list = None
+        self._tx_frame_symbol_len: int = 0
+        self._tx_index: int = 0
+
         # The base time delta between symbols nanoseconds. We start to receive symbols at
         # intervals of this value. The receiving delta could float up or down depending on
         # the algorithm used to detect the rate/phase of the incoming signal.
         self._base_delta_ns: int = NANOSECONDS_PER_SECOND // base_baud
+        self._dilated_base_delta_ns: int = _dilate_time(self._base_delta_ns)
 
         self._location: Array = Array(
             'f', [0.0] * self._supported_media[0]._dimensionality
@@ -818,32 +786,25 @@ class Transceiver(Process, ABC):
         self._connections_client: Connection = conn_client
         self._connections_listener: Connection = conn_listener
 
+        # The connection over which the transceiver communicates with the medium.
+        self._conn_2_med: Connection = None
+
+        # The connection of the medium to the transceiver. We will only use this to send
+        # a disconnect message to the medium, which is using this Connection object as a
+        # key in its connections dictionary.
+        self._conn_in_medium: Connection = None
+
         # An event to let both the main Process and any worker threads know that it's
         # time to shut down.
         self._stop_event: Event = Event()
 
-        # The pipe over which communications are sent to the next layer up. The client is
-        # used by a thread monitoring the medium to pass data up to the next layer in the
-        # OSI model (e.g., MAC in data link). The listener is used by the user to receive
-        # data from the medium via the transceiver (which is why it is public).
-        osi_listener, osi_client = Pipe(duplex=False)
-        self.osi_listener: Connection = osi_listener
-        self._osi_client: Connection = osi_client
+        # The pipe over which the bottom two layers of the OSI model communicate.
+        l2_osi_conn, l1_osi_conn = Pipe(duplex=True)
+        self.l2_osi_conn: Connection = l2_osi_conn
+        self._l1_osi_conn: Connection = l1_osi_conn
 
-        # The buffers to be used for inter-layer communication.
-        # NOTE:
-        # - These are not used within this parent class. The intention is for them to be
-        #   used as a workspace for child classes for communicating between layers. For
-        #   example, buffering two symbols of a Manchester encoded bit from the medium and
-        #   placing this decoded bit in the rx buffer before signaling to the MAC layer
-        #   that the full frame has been received.
-        # - In the absence of a bit array type, we'll use a byte array and do the
-        #   necessary bit-level operations ourselves. It is the responsibility of the next
-        #   layer up to write bytes to the buffer and read bytes from the buffer.
-        # - Because data can be sent at both positive and negative energy levels, we need
-        #   to use signed bytes.
-        self._tx_buffer: Array = Array('b', [0] * self._buffer_bytes)
-        self._rx_buffer: Array = Array('b', [0] * self._buffer_bytes)
+        self._rx_manager: ReceptionManager = ReceptionManager()
+        self._rx_manager_lock: Lock = Lock()
 
         self._init_shared_objects()
 
@@ -925,17 +886,14 @@ class Transceiver(Process, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _next_tx_symbol(self) -> Number | None:
-        """Provide us with the next symbol to be put on the medium. It is up to the
-        subclasses to determine how to do this (e.g., encoding), and the result will be
-        sent to the medium via the :attr:`_tx_queue`. For example, a :class:`Transceiver`
-        which uses Manchester encoding might take the next bit from the :attr:`_tx_buffer`
-        and convert it into the two symbols needed to represent it. It would then buffer
-        the second symbol and return the first. On the next call, it would return the
-        second symbol and buffer the next bit in the data.
+    def _translate_frame(self, frame: tuple[int]):
+        """Translate the frame from L2 into a sequence of symbols as they will appear in
+        the medium.
 
-        If the :attr:`_tx_buffer` is empty, this method should return `None` to indicate
-        that there is no more data to send, since a 0 could be a valid symbol.
+        It is up to the subclasses to determine how to do this (e.g., encoding,
+        modulating), and the result will be sent to the medium. For example, a
+        :class:`Transceiver` which uses Manchester encoding might each bit and convert it
+        into the two symbols needed to represent it.
         """
         raise NotImplementedError
 
@@ -960,12 +918,10 @@ class Transceiver(Process, ABC):
 
     # endregion
 
-    # region Multiprocessing- / IPC-related methods
+    # region Multiprocessing-related / IPC-related methods
 
     def run(self):
         log.info(f'Starting transceiver process ({self.pid})')
-
-        current_conn: Connection = None
 
         while not self._stop_event.is_set():
             # Wait for a connection update.
@@ -974,76 +930,83 @@ class Transceiver(Process, ABC):
                 break
 
             if new_conn is not None:
-                # Start up a new thread which will use this connection to receive data,
-                # process it and relay the result to the next layer up.
-                thread = Thread(
-                    target=self._monitor_medium,
-                    args=(new_conn,),
-                )
-                thread.start()
+                # Start up a new thread which will use these connections to communicate
+                # data, process it and relay the result to the next layer up.
+                self._conn_2_med = new_conn
 
-                # Store the new connection such that we may send a close message on
-                # disconnection, thereby letting the thread unblock.
-                current_conn = new_conn
+                # We'll consider this as being a transmission to the medium (more of a
+                # meta transmission, but it starts the clock that we will use to compare
+                # against future comms).
+                self._last_medium_tx_ns = monotonic_ns()
+                thread = Thread(target=self._monitor_medium)
+                thread.start()
             else:
                 # Stop the thread which is currently receiving bits.
-                current_conn.send(ManagementMessages.CLOSE)
+                self._conn_2_med.send(ManagementMessages.CLOSE)
                 thread.join()
 
-                current_conn.close()
-                current_conn = None
+                self._conn_2_med.close()
+                self._conn_2_med = None
                 self._medium = None
+                self._last_medium_tx_ns = None
 
         # If we're exiting the loop, we need to make sure that the thread is joined.
-        if current_conn is not None:
+        if self._conn_2_med is not None:
+            self._conn_2_med.send(ManagementMessages.CLOSE)
             thread.join()
 
         log.debug(f'{self}: shutting down')
 
-    def _monitor_medium(self, conn: Connection):
-        """Watch the medium for incoming data. This method will be run in a Thread whose
-        lifetime is only as long as the lifetime of the connection to the medium. That is,
-        the thread will be started when the connection is first made and will be stopped
-        when the connection is terminated."""
+    def _monitor_medium(self):
+        """This method has several responsibilities:
+            1. Wait for symbols from the medium and add them to the set of transmissions
+                to be processed.
+            2. Wait for frames from the next layer up and ensure that they are sent to
+                the medium, symbol by symbol.
+            3. Reading the medium's intensity either at prescribed intervals or when it
+                goes from being idle to being active.
+            4. Sending completed frames to the next layer up.
+
+        These events can be categorized into two groups: those which are expected and
+        occur after a defined delta, and those which are unexpected and arrive randomly
+        from either the medium or the next layer up.
+
+        It will be run in a :class:`~Thread` whose lifetime is only as long as the
+        lifetime of the connection to the medium. That is, the :class:`~Thread` will be
+        started when the connection is first made and will be stopped when the connection
+        is terminated.
+        """
+        conns_to_monitor = (self._conn_2_med, self._l1_osi_conn)
+
         while not self._stop_event.is_set():
-            try:
-                data = conn.recv()
-            except Exception as e:
-                log.error(f'{self}: Error receiving data from medium: {e}')
-                continue
+            # Walk through the knowns.
+            self._process_receptions()
+            self._process_transmissions()
 
-            if data is ManagementMessages.CLOSE:
-                break
-
-            # At this point we're expecting something of the form (tx/rx flag, amplitude).
             try:
-                comms_type, amplitude = data
-            except TypeError:
-                log.error(
-                    (
-                        f'{self}: Received malformed communications event data from '
-                        f'medium: {data=}'
-                    )
+                next_event_ns = min(
+                    event for event in (self._next_tx_ns, self._next_rx_ns) if event
                 )
-                continue
-
-            if comms_type == CommsType.RECEIVE:
-                self._process_reception_event(conn, amplitude)
-            elif comms_type == CommsType.TRANSMIT:
-                self._process_transmission_event(conn)
+            except ValueError:
+                # There are no known events, so we wait indefinitely for something to come
+                # in from either the medium or the next layer up.
+                timeout = None
             else:
-                log.error(
-                    (
-                        f'{self}: Received unknown communications event type from '
-                        f'medium: {comms_type=}'
-                    )
-                )
+                # Get the delta until the next event.
+                timeout = next_event_ns - monotonic_ns()
 
-        # We've exited the loop. This means our work is done, and we should close the
-        # connection on our end.
-        conn.close()
+            # Until that event occurs, wait for something to arrive from either the medium
+            # or the next layer up.
+            for conn in conn_wait(conns_to_monitor, timeout=timeout):
+                if conn is self._conn_2_med:
+                    # We've received a transmission from the medium.
+                    self._process_new_medium_reception()
+                elif conn is self._l1_osi_conn:
+                    # We've received a new transmission from the next layer up. Collect it
+                    # and prepare to send it.
+                    self._process_new_l2_frame()
 
-    def _process_reception_event(self, conn: Connection, amplitude: Number):
+    def _process_receptions(self):
         """
         It's the responsibility of the subclass to determine what to do with the observed
         amplitude (e.g., how to manipulate/decode it, where to put it). Addtionally, the
@@ -1051,92 +1014,160 @@ class Transceiver(Process, ABC):
         :class:`Medium` again, with a value of -1 indicating that we should only be
         informed of the next reception event (simulating the monitoring of the "active"
         bit).
-
-        :param conn: The connection to the medium.
-        :param amplitude: The amplitude value received from the medium.
         """
-        try:
-            next_rx_delta = self._process_rx_amplitude(amplitude)
-        except Exception as e:
-            log.error(f'{self}: Error processing {amplitude=}: {e}')
-            # Regardless of the fact that there was an error, we should still be
-            # configuring the next reception time, in this case defaulting to the
-            # base delta.
-            next_rx_delta = self._base_delta_ns
+        current_ns = monotonic_ns()
 
-        if next_rx_delta is None:
+        # Get the next time that a known reception event will occur.
+        # NOTE:
+        # `ReceptionMananger.next_rx_ns` is a property which performs a calculation
+        # based on the various transmissions observed by this Python object. It is
+        # therefor more efficient to only run this calculation _after_ we've
+        # determined that we weren't in an active listening mode (e.g., though the use
+        # of `or` short-circuiting).
+        sample_ns = self._next_rx_ns or self._rx_manager.next_rx_ns
+
+        if not sample_ns or sample_ns > current_ns:
+            # No value: there are no known reception events.
+            # Active listening mode: it's not yet time to sample the ongoing transmission.
+            # Passive listening mode: the incoming reception has not yet arrived.
+            return
+
+        # Active listening mode:
+        #   the next symbol in the ongoing transmission has arrived and it's time to
+        #   sample it.
+        # Passive listening mode:
+        #   the medium has become active and it's time to sample it.
+        amplitude = self._rx_manager.get_amplitude(sample_ns)
+
+        # For whatever reason, we just read an amplitude from the medium. We need to
+        # process it and determine when the next sample should be taken.
+        rx_sample_delta_ns = self._process_rx_amplitude(amplitude)
+
+        if rx_sample_delta_ns == -1:
+            # We're finished processing a transmission, so we switch back to passive
+            # listening mode.
+            self._next_rx_ns = None
+            return
+
+        if rx_sample_delta_ns is None:
             # If the subclass didn't give us a next reception time, we'll just default to
             # half of the base delta, in keeping with the Nyquist-Shannon sampling
             # theorem.
-            next_rx_delta = self._base_delta_ns / 2
+            rx_sample_delta_ns = self._base_delta_ns / 2
 
-        # Reply with the next reception time.
-        conn.send(next_rx_delta)
+        # Configure the next reception time, accounting for time dilation.
+        self._next_rx_ns = sample_ns + _dilate_time(rx_sample_delta_ns)
 
-    def _process_transmission_event(self, conn: Connection):
-        """
-        The :class:`Medium` is telling us that we must now put a symbol on the
-        :class:`Medium`. It's the responsibility of the subclass to determine how to
-        create the symbol (e.g., how to manipulate/encode it, where to get it from). All
-        we do is make sure to send a representative function to the :class:`Medium`.
-        """
-        try:
-            symbol = self._next_tx_symbol()
-        except Exception as e:
-            log.error(f'{self}: Error getting next symbol to transmit: {e}')
-
-            # Tell the medium to move on without us.
-            conn.send(None)
+    def _process_transmissions(self):
+        if not (next_tx_ns := self._next_tx_ns) or next_tx_ns > monotonic_ns():
+            # Either we're not currently transmitting or it's not yet time to send the
+            # next symbol.
             return
 
-        if symbol is None:
-            # We don't have anything to transmit, so we'll tell the medium to move on
-            # without us.
-            conn.send(None)
+        try:
+            symbol = self._tx_frame_symbols[self._tx_index]
+        except IndexError:
+            # We've gone past the end of the frame (implying no collisions), which means
+            # we're done sending the frame.
+            self._tx_frame_symbols = None
+            self._tx_frame_symbol_len = None
+            self._tx_index = 0
+            self._next_tx_ns = None
             return
 
-        # We could use EAFP to check if this is a function, but it's possible that an
-        # AttributeError will be raised by the function itself, which we should catch
-        # before passing this on the medium. So we'll use LBYL.
-        if callable(symbol):
-            # The output must be a float or integer.
-            try:
-                amplitude = symbol(0)
-            except Exception as e:
-                log.error(f'{self}: Error getting amplitude from symbol function: {e}')
+        # We need to let the medium the delta between the start of the last communication
+        # and when this communication was scheduled to start.
+        # NOTE:
+        # In the trivial, in-frame case, this is just the base delta. However, if we're
+        # beginning a new frame, we need to account for the time between frames.
+        ns_since_last_tx = next_tx_ns - self._last_medium_tx_ns
 
-                # Tell the medium to move on without us.
-                conn.send(None)
-                return
+        dilated_duration_ns = self._dilated_base_delta_ns
 
-            if not isinstance(amplitude, (int, float)):
-                log.error(
-                    f'{self}: Symbol function returned an amplitude of type '
-                    f'{amplitude.__class__.__name__} ({amplitude!r}); expected int or '
-                    'float'
-                )
-
-                # Tell the medium to move on without us.
-                conn.send(None)
-                return
-        else:
-            # Okay, so it's not a function. We'll assume it's a float or integer.
-            if not isinstance(symbol, (int, float)):
-                log.error(
-                    f'{self}: Symbol is of type {symbol.__class__.__name__} '
-                    f'({symbol!r}); expected int, float or callable'
-                )
-
-                # Tell the medium to move on without us.
-                conn.send(None)
-                return
-
-        # Send the symbol function to the medium as well as the length of the symbol in
-        # nanoseconds
         try:
-            conn.send((symbol, self._base_delta_ns))
+            # Send the symbol to the medium, letting it know how many nanoseconds have
+            # passed and how long the symbol should be.
+            self._conn_2_med.send((symbol, ns_since_last_tx, dilated_duration_ns))
         except Exception as e:
-            log.error(f'{self}: Error sending symbol function to medium: {e}')
+            log.error(f'{self}: Error sending symbol: {e}')
+
+        # Store the time that we sent the symbol to the medium such that we may reference
+        # it when sending the next symbol.
+        self._last_medium_tx_ns = next_tx_ns
+
+        # Regardless of whether or not the transmission was successful, we need to
+        # increment the index and update the next transmission time with proper
+        # inter-symbol spacing.
+        self._tx_index += 1
+        self._next_tx_ns += dilated_duration_ns
+
+    def _process_new_medium_reception(self):
+        """We've received a new transmission from the medium. We need to add it to the
+        set of transmissions to be processed.
+        """
+        try:
+            symbol_details = self._conn_2_med.recv()
+        except Exception:
+            log.error(f'{self}: Error receiving symbol details from medium')
+            return
+
+        try:
+            (
+                symbol,
+                delta_ns,
+                dilated_prop_delay_ns,
+                dilated_duration_ns,
+                attenuation,
+            ) = symbol_details
+        except ValueError:
+            log.error(
+                f'{self}: Received invalid symbol details from medium: {symbol_details!r}'
+            )
+            return
+
+        # Use the medium's view of the time since it last sent us a symbol to determine
+        # when the symbol began transmission from this Python object's perspective.
+        local_rx_time_ns = self._last_medium_rx_ns + delta_ns
+
+        with self._rx_manager_lock:
+            self._rx_manager.add_transmission(
+                symbol,
+                local_rx_time_ns + dilated_prop_delay_ns,
+                dilated_duration_ns,
+                attenuation,
+            )
+
+        # Store the time that we received the symbol from the medium object
+        # NOTE:
+        # This is not when the symbol first starts being received by the actual
+        # transceiver (which would include a propagation delay). This is just used to
+        # track comms between the Python objects.
+        self._last_medium_rx_ns = local_rx_time_ns
+
+    def _process_new_l2_frame(self):
+        """We've received a new frame from the next layer up. We need to add it to the
+        set of frames to be processed.
+        """
+        try:
+            frame = self._l1_osi_conn.recv()
+        except Exception:
+            log.error(f'{self}: Error receiving frame from next layer up')
+            return
+
+        # Convert the frame into the symbols that will be put on the medium. This should
+        # be some combination of modulation and encoding.
+        # TODO:
+        # Make each symbol actually a tuple of symbol and duration, so that we can
+        # support modulation and frequency hopping.
+        try:
+            self._tx_frame_symbols = self._translate_frame(frame)
+        except Exception as e:
+            log.error(f'{self}: Error translating frame: {e}')
+            return
+
+        self._tx_frame_symbol_len = len(self._tx_frame_symbols)
+        self._tx_index = 0
+        self._next_tx_ns = monotonic_ns()
 
     # endregion
 
@@ -1284,9 +1315,9 @@ class Transceiver(Process, ABC):
         # connection).
         self._connect(new_medium, **kwargs)
 
-        # The subclass is okay with the connection, so create pipes for transmission and
+        # The subclass is okay with the connection, so create a pipe for transmission and
         # receptions with respect to link (i.e., medium <-> transceiver).
-        xcvr_conn, medium_conn = Pipe(duplex=True)
+        medium_conn, xcvr_conn = Pipe(duplex=True)
 
         # Give one end of the pipe to the medium, the reception of which will trigger
         # its connection logic.
@@ -1320,19 +1351,31 @@ class Transceiver(Process, ABC):
                 f'{location!r}'
             )
 
-        # The medium has acknowledged the connection, meaning that we are now connected
-        # and can set our location and set up a thread to monitor the medium for incoming
-        # data.
-        self.location = location
-
         # Configure ourselves with the other ends of the pipe.
         # NOTE:
         # Because this method is being accessed outside of the process, we need to use
         # our own connection pipe to communicate the change to the process.
-        self._connections_client.send(xcvr_conn)
+        try:
+            self._connections_client.send(xcvr_conn)
+        except Exception as e:
+            raise ConnectionError(
+                f'Error sending connection pipe to {self!r} process: {e}'
+            )
 
-        # Keep track of the medium so we can disconnect from it later or prevent
-        # the changes seen at the top of this method.
+        # TODO:
+        # Get ack from process that it has received the connection pipe and is ready to
+        # work.
+
+        # The medium has acknowledged the connection and our worker process is now has a
+        # thread running to communicate iwth the medium, meaning that we are now connected
+        # and can set our location and other metadata.
+        self.location = location
+
+        # Store the Medium's connection for use in the disconnect method.
+        self._conn_in_medium = medium_conn
+
+        # Keep track of the medium so we can disconnect from it later or prevent the
+        # changes seen at the top of this method.
         self._medium = new_medium
         # Save the name separately in the array so that the process can access it as well.
         self._medium_name.value = new_medium.name.encode()
@@ -1353,7 +1396,7 @@ class Transceiver(Process, ABC):
         self._disconnect()
 
         # Alert the medium to the fact that we are disconnecting.
-        medium.disconnect(self.location)
+        medium.disconnect(self._conn_in_medium)
 
         # Finally, alert the process to the fact that we are disconnecting.
         # NOTE:

@@ -25,3 +25,7 @@ class TransmissionException(Exception):
 class TransmissionComplete(TransmissionException):
     def __str__(self):
         return 'The symbol has finished being received'
+
+
+class StopProcess(Exception):
+    pass

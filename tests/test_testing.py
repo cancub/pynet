@@ -124,7 +124,7 @@ class MockTransceiver(Transceiver, supported_media=[MockMedium], buffer_bytes=15
     def _process_rx_amplitude(self, amplitude, *args, **kwargs):
         return amplitude
 
-    def _next_tx_symbol(self, *args, **kwargs):
+    def _translate_frame(self, *args, **kwargs):
         return 0
 
 
